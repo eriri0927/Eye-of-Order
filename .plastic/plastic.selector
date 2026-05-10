@@ -1,0 +1,4 @@
+repository "米哈游@tj_eriri0927@cloud.cn"
+  path "/"
+    br "/main"
+    co "/main"
