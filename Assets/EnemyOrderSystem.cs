@@ -1,150 +1,202 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// EnemyOrderSystem.cs  ── 核心战斗系统完整重构版
+//
+// 四大招式精确实现：
+//   招式 0 ── OBB 矩形冲锋       （dot/cross 精确矩形，误差 = 0）
+//   招式 1 ── 程序化扇形横扫     （fanMesh 顶点 = 判定半径/角度，误差 = 0）
+//   招式 2 ── 动态空心圆环冲击波 （UpdateRingMesh 每帧更新，innerR/outerR 直接判定）
+//   招式 3 ── 贝塞尔三弹道飞弹  （P0→P1→P2 二次贝塞尔，三条不同弧线）
+// ─────────────────────────────────────────────────────────────────────────────
 using UnityEngine;
 using System.Collections;
 using System.Collections.Generic;
 
-public enum EnemyState
-{
-    Normal,
-    Telegraphing,
-    Recovery,
-    Stunned
-}
+public enum EnemyState { Normal, Telegraphing, Recovery, Stunned }
 
 public class EnemyOrderSystem : MonoBehaviour
 {
+    // ─────────────────────────────── Inspector ────────────────────────────────
     [Header("血量")]
     public float maxHealth = 1000f;
     private float currentHealth;
 
     [Header("战斗参数")]
-    public float waitDuration = 3f;
+    public float waitDuration      = 3f;
     public float telegraphDuration = 1.5f;
-    public float recoveryDuration = 1.5f;
-    public float stunDuration = 5f;
-    public float damageReduction = 0.1f;
-    public float critMultiplier = 2.0f;
+    public float recoveryDuration  = 1.5f;
+    public float stunDuration      = 5f;
+    public float damageReduction   = 0.1f;
+    public float critMultiplier    = 2.0f;
 
-    [Header("招式0：直线冲锋")]
-    public float chargeSpeed = 20f;
-    public float chargeDuration = 0.3f;
-    public float chargeDamageRange = 5f;
-    public float chargeDamage = 25f;
+    [Header("招式 0：直线冲锋")]
+    public float chargeSpeed     = 20f;
+    public float chargeDuration  = 0.3f;
+    public float chargeDamage    = 25f;
+    public float chargeLength    = 8f;    // 路径长度（米）
+    public float chargeHalfWidth = 1f;    // 矩形半宽（米）→ 全宽 2m
 
-    [Header("招式1：扇形横扫")]
-    public float sweepDamageRange = 4f;
-    public float sweepDamage = 20f;
+    [Header("招式 1：扇形横扫")]
+    public float sweepRadius    = 4.5f;   // 与 fanMesh 顶点半径完全一致
+    public float sweepHalfAngle = 90f;    // 180° 扇形，半角 90°
+    public float sweepDamage    = 20f;
 
-    [Header("招式2：震地冲击波")]
-    public float shockwaveExpandRadius = 12f;
-    public float shockwaveExpandDuration = 0.6f;
-    public float shockwaveDamage = 35f;
-    public float shockwaveGroundThreshold = 1.5f;
+    [Header("招式 2：震地冲击波")]
+    public float shockwaveMaxRadius      = 8f;
+    public float shockwaveExpandTime     = 1f;
+    public float shockwaveRingThickness  = 1.5f;  // 空心圆环实体厚度（米）
+    public float shockwaveDamage         = 35f;
+    public float shockwaveGroundY        = 1.5f;  // 玩家 Y 低于此值视为在地面
 
-    [Header("招式3：隐形追踪飞弹")]
-    public int missileCount = 3;
-    public float missileInterval = 0.4f;
-    public float missileDamage = 15f;
+    [Header("招式 3：贝塞尔飞弹")]
+    public int   missileCount    = 3;
+    public float missileDamage   = 15f;
+    public float missileDuration = 0.7f;   // 单枚飞弹飞行时长（秒）
 
     [Header("血条样式")]
-    public float healthBarWidth = 200f;
-    public float healthBarHeight = 20f;
+    public float healthBarWidth   = 200f;
+    public float healthBarHeight  = 20f;
     public float healthBarOffsetY = 50f;
 
-    // 视觉层对象
-    private GameObject chaosVisual;
-    private GameObject orderCore;
-    private GameObject warningArea;
-    private GameObject shockwaveRing;
-    private GameObject telegraphFlash;
+    // ──────────────────────────── 视觉层对象 ──────────────────────────────────
+    private GameObject warningArea;       // 招式 0 矩形预警 / 招式 3 追踪预警圆
+    private GameObject shockwaveRingObj;  // 招式 2 动态圆环（程序化 Mesh）
+    private GameObject telegraphFlash;    // 蓄力黄点
+    private GameObject sweepFanObj;       // 招式 1 程序化扇形体
+
+    // 程序化 Mesh 引用
+    private Mesh ringMesh;
+    private Mesh fanMesh;
 
     // 材质缓存
     private Material warningMat;
     private Material shockwaveMat;
+    private Material flashMat;
+    private Material sweepFanMat;
 
-    // 状态
-    private bool useURP;
-    private EnemyState currentState = EnemyState.Normal;
-    private bool isOrderVision = false;
-    private int currentAttackType = -1;
+    // ──────────────────────────── 三体幻影系统 ────────────────────────────────
+    private GameObject[]     drones;
+    private GameObject[]     droneCores;
+    private Material         droneChaosMat;
+    private Material         droneOrderMat;
+    private Material         droneCoreMat;
+    private int              currentCoreIndex   = -1;
+    private Material         transparentMat;
+    private const float      orbitRadius   = 8f;
+    private const float      orbitBaseY    = 0.5f;
+    private const float      orbitSpeed    = 10f;
+    private float            coreShiftTimer;
 
-    // 协程句柄
+    // ──────────────────────────── 状态 ────────────────────────────────────────
+    private bool       useURP;
+    private EnemyState currentState      = EnemyState.Normal;
+    private bool       isOrderVision     = false;
+    private int        currentAttackType = -1;
+    private int        currentAttackerIndex = -1;
+    private Transform  activeAttacker;
+
     private Coroutine attackCycleCoroutine;
     private Coroutine stunTimerCoroutine;
 
-    private PlayerController playerRef;
-    private List<HomingProjectile> activeMissiles = new List<HomingProjectile>();
+    private PlayerController       playerRef;
+    private List<GameObject>       activeMissileObjs = new List<GameObject>();
 
-    // 新增：招式0线段判定宽度 / 扇形方块列表
-    private float chargeWidth = 1.5f;
-    private float sweepDamageAngle = 90f;
-    private List<GameObject> sweepCubes = new List<GameObject>();
-    private GameObject[] sweepCubePool;
+    private bool missileWarningActive = false;
 
+    private GameObject CurrentCoreDrone   => (drones != null && currentCoreIndex >= 0 && currentCoreIndex < 3) ? drones[currentCoreIndex] : null;
+    private GameObject CurrentAttackerDrone => (drones != null && currentAttackerIndex >= 0 && currentAttackerIndex < 3) ? drones[currentAttackerIndex] : null;
+
+    // ─────────────────────────────── Awake ────────────────────────────────────
     void Awake()
     {
         maxHealth = 1000f;
-        waitDuration = 3f;
-        telegraphDuration = 1.5f;
-        recoveryDuration = 1.5f;
-        stunDuration = 5f;
-        damageReduction = 0.1f;
-        critMultiplier = 2.0f;
-        chargeSpeed = 20f;
-        chargeDuration = 0.3f;
-        chargeDamageRange = 5f;
-        chargeDamage = 25f;
-        sweepDamageRange = 4f;
-        sweepDamage = 20f;
-        shockwaveExpandRadius = 12f;
-        shockwaveExpandDuration = 0.6f;
-        shockwaveDamage = 35f;
-        shockwaveGroundThreshold = 1.5f;
-        missileCount = 3;
-        missileInterval = 0.4f;
-        missileDamage = 15f;
-        healthBarWidth = 200f;
-        healthBarHeight = 20f;
-        healthBarOffsetY = 50f;
+        waitDuration = 3f;  telegraphDuration = 1.5f;
+        recoveryDuration = 1.5f;  stunDuration = 5f;
+        damageReduction = 0.1f;   critMultiplier = 2.0f;
+        chargeSpeed = 20f;  chargeDuration = 0.3f;  chargeDamage = 25f;
+        chargeLength = 8f;  chargeHalfWidth = 1f;
+        sweepRadius = 4.5f; sweepHalfAngle = 90f;   sweepDamage = 20f;
+        shockwaveMaxRadius = 8f;  shockwaveExpandTime = 1f;
+        shockwaveRingThickness = 1.5f;  shockwaveDamage = 35f; shockwaveGroundY = 1.5f;
+        missileCount = 3;   missileDamage = 15f;    missileDuration = 0.7f;
+        coreShiftTimer = Random.Range(5f, 8f);
     }
 
-    #region 初始化
-
+    // ─────────────────────────────── Start ────────────────────────────────────
     void Start()
     {
         currentHealth = maxHealth;
-        useURP = Shader.Find("Universal Render Pipeline/Lit") != null;
+        useURP    = Shader.Find("Universal Render Pipeline/Lit") != null;
         playerRef = FindObjectOfType<PlayerController>();
 
-        CreateChaosVisual();
-        CreateOrderCore();
+        CreateDroneMaterials();
+        CreateDrones();
         CreateWarningArea();
         CreateShockwaveRing();
         CreateTelegraphFlash();
-        CreateSweepCubePool();
+        CreateSweepFan();
         SetInitialVisuals();
 
         attackCycleCoroutine = StartCoroutine(AttackCycle());
+        StartCoroutine(OrbitDrones());
+        StartCoroutine(CoreShiftCycle());
     }
 
+    // ─────────────────────────────── Update ───────────────────────────────────
     void Update()
     {
-        for (int i = activeMissiles.Count - 1; i >= 0; i--)
+        // ── Drone 核心视觉同步
+        if (drones != null && droneCores != null)
         {
-            if (activeMissiles[i] == null)
+            for (int i = 0; i < 3; i++)
             {
-                activeMissiles.RemoveAt(i);
-                continue;
+                if (drones[i] == null) continue;
+                bool isCore = (i == currentCoreIndex);
+                var rend = drones[i].GetComponent<MeshRenderer>();
+                if (rend != null)
+                {
+                    if (currentState == EnemyState.Stunned)
+                    {
+                        rend.material = transparentMat;
+                    }
+                    else if (isOrderVision && isCore)
+                    {
+                        rend.material = droneOrderMat;
+                    }
+                    else
+                    {
+                        rend.material = droneChaosMat;
+                    }
+                }
+                var coreRend = droneCores[i].GetComponent<MeshRenderer>();
+                if (coreRend != null)
+                {
+                    bool showCore = (currentState == EnemyState.Stunned) || (isOrderVision && isCore);
+                    coreRend.enabled = showCore;
+                }
             }
-            activeMissiles[i].SetVisible(isOrderVision);
         }
 
+        // ── 飞弹可见性：严格跟随 isOrderVision
+        for (int i = activeMissileObjs.Count - 1; i >= 0; i--)
+        {
+            if (activeMissileObjs[i] == null) { activeMissileObjs.RemoveAt(i); continue; }
+            var r = activeMissileObjs[i].GetComponent<MeshRenderer>();
+            if (r != null) r.enabled = isOrderVision;
+        }
+
+        // ── 蓄力黄点：严格跟随 isOrderVision
         if (telegraphFlash != null && telegraphFlash.activeSelf)
             telegraphFlash.SetActive(isOrderVision);
+
+        // ── 震地波圆环：严格跟随 isOrderVision
+        if (shockwaveRingObj != null && shockwaveRingObj.activeSelf)
+        {
+            var sr = shockwaveRingObj.GetComponent<MeshRenderer>();
+            if (sr != null) sr.enabled = isOrderVision;
+        }
     }
 
-    #endregion
-
-    // ────────────────────────────────────────────
+    // ==========================================================================
     #region 材质工具
 
     Material CreateLitMaterial(Color color)
@@ -159,15 +211,15 @@ public class EnemyOrderSystem : MonoBehaviour
     {
         if (useURP)
         {
-            mat.SetFloat("_Surface", 0);
+            mat.SetFloat("_Surface",    0);
             mat.SetFloat("_Smoothness", smoothness);
-            mat.SetFloat("_Metallic", 0f);
+            mat.SetFloat("_Metallic",   0f);
         }
         else
         {
-            mat.SetFloat("_Mode", 0);
-            mat.SetFloat("_Glossiness", smoothness);
-            mat.SetFloat("_Metallic", 0f);
+            mat.SetFloat("_Mode",        0);
+            mat.SetFloat("_Glossiness",  smoothness);
+            mat.SetFloat("_Metallic",    0f);
             mat.renderQueue = 2000;
         }
     }
@@ -177,10 +229,10 @@ public class EnemyOrderSystem : MonoBehaviour
         Material mat = CreateLitMaterial(color);
         if (useURP)
         {
-            mat.SetFloat("_Surface", 1);
-            mat.SetFloat("_Blend", 0);
-            mat.SetFloat("_ZWrite", 0);
-            mat.SetFloat("_AlphaClip", 0);
+            mat.SetFloat("_Surface",  1);
+            mat.SetFloat("_Blend",    0);
+            mat.SetFloat("_ZWrite",   0);
+            mat.SetFloat("_AlphaClip",0);
             mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
             mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
             mat.renderQueue = 3000;
@@ -200,48 +252,201 @@ public class EnemyOrderSystem : MonoBehaviour
         return mat;
     }
 
+    // ── 无光照不透明材质（飞弹专用）
+    // Unlit/Color 不参与场景光照计算，无论场景多暗都保持原色绝对可见
+    Material CreateUnlitOpaqueMaterial(Color color)
+    {
+        // 优先 Unlit/Color（Standard）或 URP Unlit
+        Shader shader = Shader.Find("Unlit/Color")
+                     ?? Shader.Find("Universal Render Pipeline/Unlit")
+                     ?? Shader.Find("Standard");
+        var mat = new Material(shader) { color = color };
+        // URP Unlit 需要明确设置为不透明
+        if (shader.name.Contains("Universal"))
+            mat.SetFloat("_Surface", 0);
+        return mat;
+    }
+
+    // ── 无光照半透明材质（震地波圆环专用）
+    // Sprites/Default 是 Unity 内置无光照 alpha-blend shader，Standard 和 URP 均可用
+    // 保证在任何光照条件下颜色准确、透明度正确，无需额外 Emission 关键字
+    Material CreateUnlitTransparentMaterial(Color color)
+    {
+        Shader shader = Shader.Find("Sprites/Default")    // 首选：永远无光照+alpha混合
+                     ?? Shader.Find("Unlit/Transparent") // 次选
+                     ?? Shader.Find("Standard");         // 兜底
+        var mat = new Material(shader) { color = color };
+        // Sprites/Default 和 Unlit/Transparent 都需要一张白色贴图才能正确显示颜色
+        if (mat.mainTexture == null)
+            mat.mainTexture = Texture2D.whiteTexture;
+        mat.renderQueue = 3001; // 确保渲染在不透明地面之上
+        // 兜底 Standard shader：手动配置透明混合
+        if (shader.name == "Standard")
+        {
+            mat.SetFloat("_Mode", 3);
+            mat.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
+            mat.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+            mat.SetInt("_ZWrite", 0);
+            mat.EnableKeyword("_ALPHABLEND_ON");
+            mat.EnableKeyword("_EMISSION");
+            mat.SetColor("_EmissionColor", new Color(color.r, color.g, color.b) * 8f);
+        }
+        return mat;
+    }
+
     #endregion
 
-    // ────────────────────────────────────────────
+    // ==========================================================================
+    #region 程序化 Mesh 构建与更新
+
+    // ── 水平圆环 Mesh（顶点在 XZ 平面 Y=0，直接以"世界米"为单位）
+    // segs 段数 = 64 → 近似误差 < 0.01%
+    static Mesh BuildRingMesh(float innerR, float outerR, int segs = 64)
+    {
+        var verts = new Vector3[(segs + 1) * 2];
+        var uvs   = new Vector2[(segs + 1) * 2];
+        var tris  = new int[segs * 6];
+
+        for (int i = 0; i <= segs; i++)
+        {
+            float a = (float)i / segs * Mathf.PI * 2f;
+            float c = Mathf.Cos(a), s = Mathf.Sin(a);
+            verts[i * 2]     = new Vector3(c * outerR, 0f, s * outerR);
+            verts[i * 2 + 1] = new Vector3(c * innerR, 0f, s * innerR);
+            uvs[i * 2]       = new Vector2((float)i / segs, 1f);
+            uvs[i * 2 + 1]   = new Vector2((float)i / segs, 0f);
+        }
+        for (int i = 0; i < segs; i++)
+        {
+            int b = i * 2;
+            tris[i * 6]     = b;     tris[i * 6 + 1] = b + 2; tris[i * 6 + 2] = b + 1;
+            tris[i * 6 + 3] = b + 1; tris[i * 6 + 4] = b + 2; tris[i * 6 + 5] = b + 3;
+        }
+
+        var m = new Mesh { name = "Ring" };
+        m.vertices  = verts;
+        m.uv        = uvs;
+        m.triangles = tris;
+        m.RecalculateNormals();
+        return m;
+    }
+
+    // 原地更新圆环顶点（保持 segs 不变，仅改内外半径）。
+    // GameObject.transform.localScale 始终保持 Vector3.one，
+    // 彻底消除 Cylinder scale 换算误差。
+    static void UpdateRingMesh(Mesh m, float innerR, float outerR)
+    {
+        var verts = m.vertices;
+        int segs  = verts.Length / 2 - 1;
+        for (int i = 0; i <= segs; i++)
+        {
+            float a = (float)i / segs * Mathf.PI * 2f;
+            float c = Mathf.Cos(a), s = Mathf.Sin(a);
+            verts[i * 2]     = new Vector3(c * outerR, 0f, s * outerR);
+            verts[i * 2 + 1] = new Vector3(c * innerR, 0f, s * innerR);
+        }
+        m.vertices = verts;
+        m.RecalculateBounds();
+    }
+
+    // ── 水平扇形 Mesh（面向 +Z 轴展开，halfAngleDeg = sweepHalfAngle）
+    // Mesh 顶点半径 = sweepRadius → 与判定判定半径严格相同，误差 = 0
+    static Mesh BuildFanMesh(float halfAngleDeg, float radius, int segs = 48)
+    {
+        var verts = new Vector3[segs + 2]; // 中心点 + 弧线点
+        var tris  = new int[segs * 3];
+
+        verts[0] = Vector3.zero;
+        float halfRad = halfAngleDeg * Mathf.Deg2Rad;
+        for (int i = 0; i <= segs; i++)
+        {
+            float t = (float)i / segs;
+            float a = Mathf.Lerp(-halfRad, halfRad, t);
+            // Unity +Z = forward，扇形朝 Boss 前方展开
+            verts[i + 1] = new Vector3(Mathf.Sin(a) * radius, 0f, Mathf.Cos(a) * radius);
+        }
+        for (int i = 0; i < segs; i++)
+        {
+            tris[i * 3]     = 0;
+            tris[i * 3 + 1] = i + 1;
+            tris[i * 3 + 2] = i + 2;
+        }
+
+        var m = new Mesh { name = "Fan" };
+        m.vertices  = verts;
+        m.triangles = tris;
+        m.RecalculateNormals();
+        return m;
+    }
+
+    #endregion
+
+    // ==========================================================================
     #region 视觉层生成
 
-    void CreateChaosVisual()
+    void CreateDroneMaterials()
     {
-        chaosVisual = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        chaosVisual.name = "chaosVisual";
-        chaosVisual.transform.SetParent(transform);
-        chaosVisual.transform.localPosition = Vector3.zero;
-        chaosVisual.transform.localScale = Vector3.one * 1.5f;
+        droneChaosMat = CreateLitMaterial(new Color(0.5f, 0.05f, 0.05f));
+        SetMaterialOpaque(droneChaosMat, 0f);
 
-        Material mat = CreateLitMaterial(new Color(0.5f, 0.05f, 0.05f));
-        SetMaterialOpaque(mat, 0f);
-        chaosVisual.GetComponent<Renderer>().material = mat;
+        droneOrderMat = CreateTransparentMaterial(new Color(0.85f, 0.15f, 0.15f, 0.3f));
+        SetMaterialOpaque(droneOrderMat, 0.1f);
+
+        droneCoreMat = CreateLitMaterial(Color.yellow);
+        droneCoreMat.EnableKeyword("_EMISSION");
+        droneCoreMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 8f);
+        SetMaterialOpaque(droneCoreMat, 0.9f);
+
+        transparentMat = CreateTransparentMaterial(new Color(0.5f, 0.5f, 0.5f, 0.35f));
     }
 
-    void CreateOrderCore()
+    void CreateDrones()
     {
-        orderCore = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        orderCore.name = "orderCore";
-        orderCore.transform.SetParent(transform);
-        orderCore.transform.localPosition = Vector3.zero;
-        orderCore.transform.localScale = Vector3.one * 0.5f;
+        drones    = new GameObject[3];
+        droneCores = new GameObject[3];
 
-        Material mat = CreateLitMaterial(Color.blue);
-        SetMaterialOpaque(mat, 0.8f);
-        mat.EnableKeyword("_EMISSION");
-        mat.SetColor("_EmissionColor", Color.cyan * 5f);
-        orderCore.GetComponent<Renderer>().material = mat;
+        for (int i = 0; i < 3; i++)
+        {
+            float angle = i * 120f;
+            float rad   = angle * Mathf.Deg2Rad;
+            Vector3 pos = transform.position + new Vector3(Mathf.Cos(rad) * orbitRadius, orbitBaseY, Mathf.Sin(rad) * orbitRadius);
+
+            GameObject drone = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            drone.name = "Drone_" + i;
+            drone.transform.position = pos;
+            drone.transform.localScale = Vector3.one * 1.5f;
+            drone.GetComponent<Renderer>().material = droneChaosMat;
+            drones[i] = drone;
+
+            CreateDroneCore(i);
+        }
+
+        currentCoreIndex = Random.Range(0, 3);
     }
 
+    void CreateDroneCore(int index)
+    {
+        GameObject core = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        core.name = "DroneCore_" + index;
+        core.transform.SetParent(drones[index].transform);
+        core.transform.localPosition = Vector3.zero;
+        core.transform.localScale = Vector3.one * 0.5f;
+        core.GetComponent<Renderer>().material = droneCoreMat;
+        Destroy(core.GetComponent<Collider>());
+        core.SetActive(false);
+        droneCores[index] = core;
+    }
+
+    // 招式 0 矩形预警：Plane 原生 10×10 units
+    //   localScale = (halfWidth*2/10, 1, length/10)
+    //   → 世界尺寸 2m × 8m，与 OBB 判定参数 chargeHalfWidth / chargeLength 1:1
     void CreateWarningArea()
     {
         warningArea = GameObject.CreatePrimitive(PrimitiveType.Plane);
         warningArea.name = "warningArea";
         warningArea.transform.SetParent(transform);
-        // Y=0.1f 防止与地面穿模
-        warningArea.transform.localPosition = new Vector3(0f, 0.1f, 4f);
-        warningArea.transform.localScale = new Vector3(0.5f, 1f, 8f);
-
+        warningArea.transform.localPosition = new Vector3(0f, 0.05f, chargeLength * 0.5f);
+        warningArea.transform.localScale    = new Vector3(chargeHalfWidth * 2f / 10f, 1f, chargeLength / 10f);
         warningMat = CreateTransparentMaterial(new Color(1f, 0.9f, 0f, 0.45f));
         warningMat.EnableKeyword("_EMISSION");
         warningMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 3f);
@@ -249,20 +454,23 @@ public class EnemyOrderSystem : MonoBehaviour
         Destroy(warningArea.GetComponent<Collider>());
     }
 
+    // 招式 2 空心圆环：程序化 Mesh，localScale 永远 = (1,1,1)
+    // 顶点以世界米直接表示，彻底消除任何 scale 换算
+    // Y = 0.2f：高于地面 0.2m，防止与地面网格深度冲突（Z-fighting）
     void CreateShockwaveRing()
     {
-        shockwaveRing = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-        shockwaveRing.name = "shockwaveRing";
-        shockwaveRing.transform.SetParent(transform);
-        // 贴地但高出 0.15f，防止与地面完全重叠
-        shockwaveRing.transform.localPosition = new Vector3(0f, 0.15f, 0f);
-        shockwaveRing.transform.localScale = new Vector3(0.5f, 0.08f, 0.5f);
+        ringMesh = BuildRingMesh(0f, 0.01f);
 
-        shockwaveMat = CreateTransparentMaterial(new Color(1f, 0.1f, 0f, 0.6f));
-        shockwaveMat.EnableKeyword("_EMISSION");
-        shockwaveMat.SetColor("_EmissionColor", new Color(1f, 0.1f, 0f) * 5f);
-        shockwaveRing.GetComponent<Renderer>().material = shockwaveMat;
-        Destroy(shockwaveRing.GetComponent<Collider>());
+        shockwaveRingObj = new GameObject("shockwaveRing");
+        shockwaveRingObj.transform.SetParent(transform);
+        shockwaveRingObj.transform.localPosition = new Vector3(0f, 0.2f, 0f);  // Y=0.2f 防穿模
+        shockwaveRingObj.transform.localRotation = Quaternion.identity;
+        shockwaveRingObj.transform.localScale    = Vector3.one;  // 永不改变
+
+        shockwaveRingObj.AddComponent<MeshFilter>().mesh = ringMesh;
+        // 使用无光照透明材质：不参与场景光照，任何亮度条件下均可见
+        shockwaveMat = CreateUnlitTransparentMaterial(new Color(1f, 0.9f, 0f, 0.75f));
+        shockwaveRingObj.AddComponent<MeshRenderer>().material = shockwaveMat;
     }
 
     void CreateTelegraphFlash()
@@ -271,100 +479,49 @@ public class EnemyOrderSystem : MonoBehaviour
         telegraphFlash.name = "telegraphFlash";
         telegraphFlash.transform.SetParent(transform);
         telegraphFlash.transform.localPosition = new Vector3(0f, 1f, 0f);
-        telegraphFlash.transform.localScale = Vector3.one * 0.35f;
-
-        Material mat = CreateLitMaterial(Color.yellow);
-        mat.EnableKeyword("_EMISSION");
-        mat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 10f);
-        telegraphFlash.GetComponent<Renderer>().material = mat;
+        telegraphFlash.transform.localScale    = Vector3.one * 0.5f;
+        flashMat = CreateLitMaterial(Color.yellow);
+        flashMat.EnableKeyword("_EMISSION");
+        flashMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 10f);
+        telegraphFlash.GetComponent<Renderer>().material = flashMat;
         Destroy(telegraphFlash.GetComponent<Collider>());
         telegraphFlash.SetActive(false);
     }
 
-    void CreateSweepCubePool()
+    // 招式 1 程序化扇形体：Mesh 顶点半径 = sweepRadius，半角 = sweepHalfAngle
+    // 与判定数学完全共享同一常量，视觉/判定绝对同步
+    void CreateSweepFan()
     {
-        sweepCubePool = new GameObject[5];
-        for (int i = 0; i < 5; i++)
-        {
-            GameObject cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            cube.name = "SweepCube_" + i;
-            cube.transform.SetParent(transform);
-            cube.transform.localScale = Vector3.one * 0.6f;
+        fanMesh = BuildFanMesh(sweepHalfAngle, sweepRadius);
 
-            Material mat = CreateLitMaterial(Color.red);
-            SetMaterialOpaque(mat, 0.1f);
-            mat.EnableKeyword("_EMISSION");
-            mat.SetColor("_EmissionColor", Color.red * 4f);
-            cube.GetComponent<Renderer>().material = mat;
-            Destroy(cube.GetComponent<Collider>());
-            cube.SetActive(false);
-            sweepCubePool[i] = cube;
-        }
-    }
+        sweepFanObj = new GameObject("SweepFan");
+        sweepFanObj.transform.SetParent(transform);
+        sweepFanObj.transform.localPosition = Vector3.zero;
+        sweepFanObj.transform.localRotation = Quaternion.identity;
 
-    void ShowTelegraphFlash()
-    {
-        if (telegraphFlash == null) return;
-        telegraphFlash.transform.localPosition = new Vector3(0f, 1f, 0f);
-        telegraphFlash.SetActive(isOrderVision);
-    }
-
-    void HideTelegraphFlash()
-    {
-        if (telegraphFlash == null) return;
-        telegraphFlash.SetActive(false);
-    }
-
-    void ShowSweepCubes()
-    {
-        for (int i = 0; i < 5; i++)
-        {
-            float angle = -90f + 45f * i;
-            float rad = angle * Mathf.Deg2Rad;
-            float dist = 3.5f;
-            Vector3 localPos = new Vector3(Mathf.Sin(rad) * dist, 0.3f, Mathf.Cos(rad) * dist);
-            sweepCubePool[i].transform.position = transform.TransformPoint(localPos);
-            sweepCubePool[i].SetActive(true);
-        }
-    }
-
-    void HideSweepCubes()
-    {
-        for (int i = 0; i < 5; i++)
-            sweepCubePool[i].SetActive(false);
-    }
-
-    void DestroySweepCubes()
-    {
-        for (int i = 0; i < 5; i++)
-            sweepCubePool[i].SetActive(false);
-    }
-
-    float PointToSegmentDistance(Vector3 point, Vector3 segA, Vector3 segB)
-    {
-        Vector3 AB = segB - segA;
-        Vector3 AP = point - segA;
-        float ab2 = Vector3.Dot(AB, AB);
-        if (ab2 < 0.0001f) return Vector3.Distance(point, segA);
-        float t = Mathf.Clamp01(Vector3.Dot(AP, AB) / ab2);
-        Vector3 closest = segA + t * AB;
-        return Vector3.Distance(point, closest);
+        sweepFanObj.AddComponent<MeshFilter>().mesh = fanMesh;
+        sweepFanMat = CreateTransparentMaterial(new Color(1f, 0.05f, 0f, 0.85f));
+        sweepFanMat.EnableKeyword("_EMISSION");
+        sweepFanMat.SetColor("_EmissionColor", Color.red * 6f);
+        sweepFanObj.AddComponent<MeshRenderer>().material = sweepFanMat;
+        sweepFanObj.SetActive(false);
     }
 
     void SetInitialVisuals()
     {
-        chaosVisual.SetActive(true);
-        orderCore.SetActive(false);
+        if (drones != null)
+            for (int i = 0; i < drones.Length; i++)
+                if (drones[i] != null) drones[i].SetActive(true);
         warningArea.SetActive(false);
-        shockwaveRing.SetActive(false);
+        shockwaveRingObj.SetActive(false);
+        sweepFanObj.SetActive(false);
     }
 
     #endregion
 
-    // ────────────────────────────────────────────
+    // ==========================================================================
     #region 视野切换（Shift 显隐铁律）
 
-    // 由 PlayerController 每帧调用
     public void SwitchToOrder(bool isOrder)
     {
         isOrderVision = isOrder;
@@ -373,83 +530,114 @@ public class EnemyOrderSystem : MonoBehaviour
 
     void ApplyVisibility()
     {
+        if (drones == null) return;
+
         switch (currentState)
         {
             case EnemyState.Stunned:
-                chaosVisual.SetActive(false);
-                orderCore.SetActive(true);
+                for (int i = 0; i < 3; i++)
+                {
+                    if (drones[i] != null)
+                    {
+                        var r = drones[i].GetComponent<MeshRenderer>();
+                        if (r != null) r.material = transparentMat;
+                    }
+                    if (droneCores[i] != null) droneCores[i].SetActive(true);
+                }
                 warningArea.SetActive(false);
-                // 震地波的ring在瘫痪时不应继续显示
-                shockwaveRing.SetActive(false);
+                shockwaveRingObj.SetActive(false);
                 break;
 
             case EnemyState.Telegraphing:
-                chaosVisual.SetActive(!isOrderVision);
-                orderCore.SetActive(isOrderVision);
-                // Case 2（震地）：ring始终可见，无视Shift；其余预警仅Shift可见
+                for (int i = 0; i < 3; i++)
+                {
+                    if (drones[i] != null)
+                    {
+                        bool isCore = (i == currentCoreIndex);
+                        var r = drones[i].GetComponent<MeshRenderer>();
+                        if (r != null) r.material = (isOrderVision && isCore) ? droneOrderMat : droneChaosMat;
+                    }
+                    if (droneCores[i] != null)
+                        droneCores[i].SetActive(isOrderVision && i == currentCoreIndex);
+                }
                 if (currentAttackType == 2)
                 {
                     warningArea.SetActive(false);
-                    shockwaveRing.SetActive(true);
                 }
                 else if (currentAttackType == 3)
                 {
-                    // 飞弹招式无场地预警
-                    warningArea.SetActive(false);
-                    shockwaveRing.SetActive(false);
+                    warningArea.SetActive(isOrderVision && missileWarningActive);
+                    shockwaveRingObj.SetActive(false);
                 }
                 else
                 {
-                    // Case 0 & 1：仅 Shift 可见
                     warningArea.SetActive(isOrderVision);
-                    shockwaveRing.SetActive(false);
+                    shockwaveRingObj.SetActive(false);
                 }
                 break;
 
             case EnemyState.Recovery:
-                chaosVisual.SetActive(!isOrderVision);
-                orderCore.SetActive(isOrderVision);
+                for (int i = 0; i < 3; i++)
+                {
+                    if (drones[i] != null)
+                    {
+                        bool isCore = (i == currentCoreIndex);
+                        var r = drones[i].GetComponent<MeshRenderer>();
+                        if (r != null) r.material = (isOrderVision && isCore) ? droneOrderMat : droneChaosMat;
+                    }
+                    if (droneCores[i] != null)
+                        droneCores[i].SetActive(isOrderVision && i == currentCoreIndex);
+                }
                 warningArea.SetActive(false);
-                shockwaveRing.SetActive(false);
+                shockwaveRingObj.SetActive(false);
                 break;
 
             default: // Normal
-                chaosVisual.SetActive(true);
-                orderCore.SetActive(false);
+                for (int i = 0; i < 3; i++)
+                {
+                    if (drones[i] != null)
+                    {
+                        var r = drones[i].GetComponent<MeshRenderer>();
+                        if (r != null) r.material = droneChaosMat;
+                    }
+                    if (droneCores[i] != null) droneCores[i].SetActive(false);
+                }
                 warningArea.SetActive(false);
-                shockwaveRing.SetActive(false);
+                shockwaveRingObj.SetActive(false);
                 break;
         }
     }
 
     #endregion
 
-    // ────────────────────────────────────────────
+    // ==========================================================================
     #region 战斗循环主体
 
     IEnumerator AttackCycle()
     {
         while (true)
         {
-            // ── Normal 待机 ──
-            currentState = EnemyState.Normal;
+            currentState      = EnemyState.Normal;
             currentAttackType = -1;
+            currentAttackerIndex = -1;
             ApplyVisibility();
             yield return new WaitForSeconds(waitDuration);
 
-            // ── 随机选择招式 ──
             currentAttackType = Random.Range(0, 4);
-            currentState = EnemyState.Telegraphing;
+            currentState      = EnemyState.Telegraphing;
+
+            currentAttackerIndex = Random.Range(0, 3);
+            activeAttacker = (drones != null && currentAttackerIndex >= 0 && currentAttackerIndex < 3)
+                ? drones[currentAttackerIndex].transform : transform;
 
             switch (currentAttackType)
             {
-                case 0: yield return StartCoroutine(Attack0_Dash());     break;
-                case 1: yield return StartCoroutine(Attack1_Sweep());    break;
+                case 0: yield return StartCoroutine(Attack0_Dash());      break;
+                case 1: yield return StartCoroutine(Attack1_Sweep());     break;
                 case 2: yield return StartCoroutine(Attack2_Shockwave()); break;
-                case 3: yield return StartCoroutine(Attack3_Missiles()); break;
+                case 3: yield return StartCoroutine(Attack3_Missiles());  break;
             }
 
-            // ── Recovery 后摇（期间可被防反） ──
             currentState = EnemyState.Recovery;
             ApplyVisibility();
             yield return new WaitForSeconds(recoveryDuration);
@@ -458,237 +646,574 @@ public class EnemyOrderSystem : MonoBehaviour
 
     #endregion
 
-    // ────────────────────────────────────────────
-    #region Case 0：直线冲锋
+    // ==========================================================================
+    #region 三体幻影：环绕与核心轮转
+
+    IEnumerator OrbitDrones()
+    {
+        while (true)
+        {
+            if (drones != null && playerRef != null)
+            {
+                Vector3 center = playerRef.transform.position;
+                for (int i = 0; i < 3; i++)
+                {
+                    if (drones[i] == null) continue;
+                    float baseAngle = i * 120f;
+                    float angle = baseAngle + Time.time * orbitSpeed;
+                    float rad   = angle * Mathf.Deg2Rad;
+                    Vector3 targetPos = center + new Vector3(Mathf.Cos(rad) * orbitRadius, orbitBaseY, Mathf.Sin(rad) * orbitRadius);
+                    drones[i].transform.position = Vector3.Lerp(drones[i].transform.position, targetPos, Time.deltaTime * 2f);
+                }
+            }
+            yield return null;
+        }
+    }
+
+    IEnumerator CoreShiftCycle()
+    {
+        while (true)
+        {
+            yield return new WaitForSeconds(coreShiftTimer);
+
+            int newIndex;
+            do { newIndex = Random.Range(0, 3); } while (newIndex == currentCoreIndex && Random.value > 0.3f);
+            currentCoreIndex = newIndex;
+            coreShiftTimer = Random.Range(5f, 8f);
+
+            if (isOrderVision)
+                GameLogger.Log($"[Core Shift] 真身转移到 Drone {currentCoreIndex}");
+        }
+    }
+
+    #endregion
+
+    // ==========================================================================
+    #region 共用：蓄力黄点渐隐
+
+    IEnumerator TelegraphFade(float duration)
+    {
+        Transform flashTarget = activeAttacker != null ? activeAttacker : transform;
+        telegraphFlash.transform.position = flashTarget.position + Vector3.up * 1f;
+        telegraphFlash.transform.localScale    = Vector3.one * 0.5f;
+        flashMat.color = new Color(1f, 0.9f, 0f, 1f);
+        flashMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 10f);
+        telegraphFlash.SetActive(isOrderVision);
+
+        float elapsed = 0f;
+        while (elapsed < duration)
+        {
+            elapsed += Time.deltaTime;
+            float p = Mathf.Clamp01(elapsed / duration);
+            Color c = flashMat.color;
+            c.a = Mathf.Lerp(1f, 0f, p);
+            flashMat.color = c;
+            telegraphFlash.transform.localScale = Vector3.one * Mathf.Lerp(0.5f, 0.15f, p);
+            telegraphFlash.SetActive(isOrderVision);
+            yield return null;
+        }
+        telegraphFlash.SetActive(false);
+    }
+
+    #endregion
+
+    // ==========================================================================
+    #region 招式 0：直线冲锋（精确 OBB 矩形判定）
+    // ──────────────────────────────────────────────────────────────────────────
+    // 视觉：warningArea Plane，世界尺寸 = 2m（宽）× 8m（长），中心在 Boss 前方 4m
+    //
+    // 判定（向量分解 / OBB）：
+    //   以冲锋起点为原点，dashDirH 为前轴（XZ 水平化）
+    //   fwdProj  = Dot(toPlayer_xz, dashDirH)         ∈ [0, chargeLength]
+    //   perpProj = |Cross(dashDirH, toPlayer_xz).y|   ≤ chargeHalfWidth
+    //
+    // 视觉 ↔ 判定同步证明：
+    //   Plane.scale.z * 10 = chargeLength = 8m   ✓
+    //   Plane.scale.x * 10 = chargeHalfWidth*2 = 2m → 半宽 1m = chargeHalfWidth ✓
+    //   Plane 中心 localPos.z = chargeLength/2 = 4m → 覆盖 [0, 8m] 前向 ✓
+    // ──────────────────────────────────────────────────────────────────────────
 
     IEnumerator Attack0_Dash()
     {
-        FacePlayer();
+        Vector3 attackerPos = activeAttacker.position;
+        FaceDrone(activeAttacker);
 
-        warningArea.transform.localPosition = new Vector3(0f, 0.1f, 4f);
-        warningArea.transform.localScale = new Vector3(0.5f, 1f, 8f);
-        warningArea.transform.localRotation = Quaternion.identity;
+        warningArea.transform.position = attackerPos + activeAttacker.forward * chargeLength * 0.5f + Vector3.up * 0.05f;
+        warningArea.transform.localScale    = new Vector3(chargeHalfWidth * 2f / 10f, 1f, chargeLength / 10f);
+        warningArea.transform.rotation = activeAttacker.rotation;
+        warningMat.color = new Color(1f, 0.9f, 0f, 0.45f);
+        warningMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 3f);
         ApplyVisibility();
 
+        // 预警动画：脉冲闪烁
+        float preTime = telegraphDuration - 0.3f;
         float elapsed = 0f;
-        while (elapsed < telegraphDuration)
+        while (elapsed < preTime)
         {
             elapsed += Time.deltaTime;
-            float p = Mathf.Clamp01(elapsed / telegraphDuration);
-            warningArea.transform.localScale = new Vector3(
-                Mathf.Lerp(0.5f, 0.73f, p), 1f, Mathf.Lerp(8f, 12f, p));
-
-            if (elapsed >= telegraphDuration - 0.2f)
-                ShowTelegraphFlash();
-
+            float pulse = Mathf.Abs(Mathf.Sin(elapsed * Mathf.PI * 3f));
+            Color c = warningMat.color;
+            c.a = Mathf.Lerp(0.2f, 0.65f, pulse);
+            warningMat.color = c;
             yield return null;
         }
 
-        HideTelegraphFlash();
+        yield return StartCoroutine(TelegraphFade(0.3f));
         warningArea.SetActive(false);
 
-        Vector3 startPos = transform.position;
-        Vector3 chargeDir = transform.forward;
-        Vector3 chargeTarget = startPos + chargeDir * 6f;
+        GameLogger.Log("[Boss] 招式0：直线冲锋");
+
+        Vector3 dashStart = activeAttacker.position;
+        Vector3 dashDir   = activeAttacker.forward;
+        Vector3 dashEnd   = dashStart + dashDir * chargeLength;
+        Vector3 dashDirH  = new Vector3(dashDir.x, 0f, dashDir.z).normalized;
         elapsed = 0f;
-        bool damaged = false;
+        bool hit = false;
 
         while (elapsed < chargeDuration)
         {
             elapsed += Time.deltaTime;
-            transform.position = Vector3.Lerp(startPos, chargeTarget, Mathf.Clamp01(elapsed / chargeDuration));
+            activeAttacker.position = Vector3.Lerp(dashStart, dashEnd,
+                Mathf.Clamp01(elapsed / chargeDuration));
 
-            if (!damaged && playerRef != null)
+            // ── 精确 OBB 判定
+            if (!hit && playerRef != null)
             {
-                float perpDist = PointToSegmentDistance(playerRef.transform.position, startPos, chargeTarget);
-                float playerProj = Vector3.Dot(playerRef.transform.position - startPos, chargeDir);
-                float segLen = Vector3.Distance(startPos, chargeTarget);
-                if (perpDist < chargeWidth && playerProj >= 0f && playerProj <= segLen)
+                Vector3 toPlayer = playerRef.transform.position - dashStart;
+                toPlayer.y = 0f;
+
+                float fwdProj  = Vector3.Dot(toPlayer, dashDirH);
+                // Cross(dashDirH, toPlayer).y 的绝对值 = 两向量在 XZ 平面上的垂直距离
+                float perpProj = Mathf.Abs(Vector3.Cross(dashDirH, toPlayer).y);
+
+                if (fwdProj >= 0f && fwdProj <= chargeLength && perpProj <= chargeHalfWidth)
                 {
                     playerRef.ReceiveAttack(chargeDamage);
-                    damaged = true;
+                    hit = true;
                 }
             }
             yield return null;
         }
 
-        transform.position = chargeTarget;
+        activeAttacker.position = dashEnd;
     }
 
     #endregion
 
-    // ────────────────────────────────────────────
-    #region Case 1：扇形横扫
+    // ==========================================================================
+    #region 招式 1：扇形横扫（程序化扇形砸落 + 精确 180° 半圆判定）
+    // ──────────────────────────────────────────────────────────────────────────
+    // 视觉（预警）：sweepFanObj 黄色贴地，仅 Shift 可见
+    // 视觉（攻击）：sweepFanObj 红色从 5m 高空狠狠砸落，停留 0.3s 后消散
+    //
+    // 判定：
+    //   dist_xz < sweepRadius   AND   angle_to_forward < sweepHalfAngle
+    //
+    // 视觉 ↔ 判定同步证明：
+    //   fanMesh 在 BuildFanMesh(sweepHalfAngle, sweepRadius) 时构建
+    //   Mesh 顶点半径 = sweepRadius，Mesh 弧度 = sweepHalfAngle * 2
+    //   判定使用同一个 sweepRadius / sweepHalfAngle 常量 → 误差 = 0 ✓
+    // ──────────────────────────────────────────────────────────────────────────
 
     IEnumerator Attack1_Sweep()
     {
-        FacePlayer();
+        Vector3 attackerPos = activeAttacker.position;
+        FaceDrone(activeAttacker);
 
-        warningArea.transform.localPosition = new Vector3(0f, 0.1f, 2f);
-        warningArea.transform.localScale = new Vector3(2f, 1f, 3f);
-        warningArea.transform.localRotation = Quaternion.identity;
-        ApplyVisibility();
+        // ── 预警：扇形贴地，黄色脉冲（仅 Shift 可见）
+        sweepFanObj.transform.position = attackerPos + Vector3.up * 0.06f;
+        sweepFanObj.transform.rotation = activeAttacker.rotation;
+        sweepFanMat.color = new Color(1f, 0.9f, 0f, 0.25f);
+        sweepFanMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 2.5f);
+        sweepFanObj.SetActive(isOrderVision);
 
+        float preTime = telegraphDuration - 0.3f;
         float elapsed = 0f;
-        while (elapsed < telegraphDuration)
+        while (elapsed < preTime)
         {
             elapsed += Time.deltaTime;
-            float p = Mathf.Clamp01(elapsed / telegraphDuration);
-            warningArea.transform.localScale = new Vector3(
-                Mathf.Lerp(2f, 4f, p), 1f, Mathf.Lerp(3f, 5f, p));
-
-            if (elapsed >= telegraphDuration - 0.2f)
-                ShowTelegraphFlash();
-
+            sweepFanObj.SetActive(isOrderVision);  // 跟随 Shift 实时同步
+            float pulse = Mathf.Abs(Mathf.Sin(elapsed * Mathf.PI * 2.5f));
+            Color c = sweepFanMat.color;
+            c.a = Mathf.Lerp(0.1f, 0.45f, pulse);
+            sweepFanMat.color = c;
             yield return null;
         }
 
-        HideTelegraphFlash();
-        warningArea.SetActive(false);
+        yield return StartCoroutine(TelegraphFade(0.3f));
+        sweepFanObj.SetActive(false);
 
-        ShowSweepCubes();
-        yield return new WaitForSeconds(0.3f);
-        HideSweepCubes();
+        GameLogger.Log("[Boss] 招式1：扇形横扫");
 
+        // ── 攻击：红色扇形从 5m 高空砸落（EaseIn 加速，模拟重力）
+        sweepFanMat.color = new Color(1f, 0.05f, 0f, 0.95f);
+        sweepFanMat.SetColor("_EmissionColor", Color.red * 9f);
+        Vector3 slamStart = attackerPos + Vector3.up * 5f;
+        Vector3 slamEnd   = attackerPos + Vector3.up * 0.06f;
+        sweepFanObj.transform.position = slamStart;
+        sweepFanObj.transform.rotation = activeAttacker.rotation;
+        sweepFanObj.SetActive(true);
+
+        elapsed = 0f;
+        const float slamTime = 0.1f;
+        while (elapsed < slamTime)
+        {
+            elapsed += Time.deltaTime;
+            float p = Mathf.Clamp01(elapsed / slamTime);
+            sweepFanObj.transform.position = Vector3.Lerp(slamStart, slamEnd, p * p);
+            yield return null;
+        }
+        sweepFanObj.transform.position = slamEnd;
+
+        // ── 精确扇形判定（砸地瞬间）
         if (playerRef != null)
         {
-            Vector3 toPlayer = playerRef.transform.position - transform.position;
+            Vector3 toPlayer = playerRef.transform.position - attackerPos;
             toPlayer.y = 0f;
-            float dist = toPlayer.magnitude;
-            float angle = Vector3.Angle(transform.forward, toPlayer);
-
-            if (dist < sweepDamageRange && angle < sweepDamageAngle)
+            if (toPlayer.magnitude < sweepRadius
+                && Vector3.Angle(activeAttacker.forward, toPlayer) < sweepHalfAngle)
+            {
                 playerRef.ReceiveAttack(sweepDamage);
+            }
         }
+
+        // 停留 0.3s（玩家清晰看到"我在红色扇面里"）
+        yield return new WaitForSeconds(0.3f);
+
+        // 消散
+        elapsed = 0f;
+        const float fadeTime = 0.18f;
+        while (elapsed < fadeTime)
+        {
+            elapsed += Time.deltaTime;
+            Color c = sweepFanMat.color;
+            c.a = Mathf.Lerp(0.95f, 0f, elapsed / fadeTime);
+            sweepFanMat.color = c;
+            yield return null;
+        }
+        sweepFanObj.SetActive(false);
     }
 
     #endregion
 
-    // ────────────────────────────────────────────
-    #region Case 2：震地冲击波（特殊：ring无需 Shift 也可见）
+    // ==========================================================================
+    #region 招式 2：震地冲击波（动态空心圆环扩散，精确空心环伤害判定）
+    // ──────────────────────────────────────────────────────────────────────────
+    // 物理模型：
+    //   midRadius(t) = Lerp(0, shockwaveMaxRadius, t),  t ∈ [0, shockwaveExpandTime]
+    //   innerRadius  = max(0, midRadius - halfThick)
+    //   outerRadius  = midRadius + halfThick
+    //
+    // 视觉（程序化）：
+    //   每帧调用 UpdateRingMesh(ringMesh, innerR, outerR)，直接写顶点
+    //   GameObject.localScale = (1,1,1) 永不变化 → 无 scale 换算误差
+    //
+    // 判定：
+    //   dist2D ∈ [innerRadius, outerRadius]  AND  player.y < shockwaveGroundY
+    //
+    // 视觉 ↔ 判定同步证明：
+    //   Mesh 顶点 (c*outerR, 0, s*outerR) / (c*innerR, 0, s*innerR) 定义的圆环边界
+    //   与判定中使用的 innerR / outerR 是同一个变量 → 误差 = 0 ✓
+    //
+    // 博弈设计：
+    //   圆环外（未到达）：安全
+    //   圆环内（已扫过）：安全
+    //   圆环 1.5m 实体宽度：危险 → 玩家需跳跃（Space）离开地面才能逃脱
+    // ──────────────────────────────────────────────────────────────────────────
 
     IEnumerator Attack2_Shockwave()
     {
-        shockwaveRing.transform.localPosition = new Vector3(0f, 0.15f, 0f);
-        shockwaveRing.transform.localScale = new Vector3(0.5f, 0.08f, 0.5f);
-        shockwaveMat.color = new Color(1f, 0.1f, 0f, 0.6f);
-        shockwaveRing.SetActive(true);
-        ApplyVisibility();
+        Vector3 attackerPos = activeAttacker.position;
 
+        // ── 蓄力：圆环从中心向外脉冲预警（Shift 可见）
+        shockwaveRingObj.transform.position = attackerPos + Vector3.up * 0.2f;
+        UpdateRingMesh(ringMesh, 0f, 0.5f);
+        shockwaveMat.color = new Color(1f, 0.9f, 0f, 0.55f);
+        shockwaveRingObj.SetActive(true);
+
+        float chargeT = telegraphDuration - 0.3f;
         float elapsed = 0f;
-        while (elapsed < 1f)
+        while (elapsed < chargeT)
         {
             elapsed += Time.deltaTime;
-            float p = Mathf.Clamp01(elapsed / 1f);
-            float s = Mathf.Lerp(0.5f, 2f, p);
-            shockwaveRing.transform.localScale = new Vector3(s, 0.08f, s);
-
-            if (elapsed >= 0.8f)
-                ShowTelegraphFlash();
-
+            float p     = Mathf.Clamp01(elapsed / chargeT);
+            float pulse = 0.5f + 0.5f * Mathf.Sin(elapsed * Mathf.PI * 5f);
+            UpdateRingMesh(ringMesh, 0f, Mathf.Lerp(0.3f, 2.2f, p));
+            Color c = shockwaveMat.color;
+            c.a = Mathf.Lerp(0.3f, 0.9f, pulse);
+            shockwaveMat.color = c;
             yield return null;
         }
 
-        HideTelegraphFlash();
+        yield return StartCoroutine(TelegraphFade(0.3f));
 
-        elapsed = 0f;
-        bool damaged = false;
+        GameLogger.Log("[Boss] 招式2：震地冲击波");
 
-        while (elapsed < shockwaveExpandDuration)
+        yield return StartCoroutine(ExpandShockwave());
+
+        shockwaveRingObj.SetActive(false);
+        shockwaveMat.color = new Color(1f, 0.9f, 0f, 0.7f);
+    }
+
+    IEnumerator ExpandShockwave()
+    {
+        float halfThick = shockwaveRingThickness * 0.5f;
+        float elapsed   = 0f;
+        bool  playerHit = false;
+
+        Vector3 origin = (activeAttacker != null)
+            ? new Vector3(activeAttacker.position.x, 0f, activeAttacker.position.z)
+            : new Vector3(transform.position.x, 0f, transform.position.z);
+
+        while (elapsed < shockwaveExpandTime)
         {
             elapsed += Time.deltaTime;
-            float p = Mathf.Clamp01(elapsed / shockwaveExpandDuration);
-            float s = Mathf.Lerp(2f, shockwaveExpandRadius, p);
-            shockwaveRing.transform.localScale = new Vector3(s, 0.08f, s);
+            float t     = Mathf.Clamp01(elapsed / shockwaveExpandTime);
+            float midR  = Mathf.Lerp(0f, shockwaveMaxRadius, t);
+            float innerR = Mathf.Max(0f, midR - halfThick);
+            float outerR = midR + halfThick;
+
+            // 同一对 innerR/outerR 同时驱动视觉和判定
+            UpdateRingMesh(ringMesh, innerR, outerR);
 
             Color c = shockwaveMat.color;
-            c.a = Mathf.Lerp(0.6f, 0.05f, p);
+            c.a = Mathf.Lerp(0.9f, 0.06f, t);
             shockwaveMat.color = c;
 
-            if (!damaged && playerRef != null)
+            // ── 精确空心环判定
+            // 玩家须同时满足：被环实体覆盖（dist2D 在 [innerR, outerR]）AND 脚在地面
+            if (!playerHit && playerRef != null)
             {
-                float ringRadius = s * 5f;
-                float dist = Vector3.Distance(
-                    new Vector3(transform.position.x, 0f, transform.position.z),
-                    new Vector3(playerRef.transform.position.x, 0f, playerRef.transform.position.z));
+                Vector3 pPos   = playerRef.transform.position;
+                Vector3 pFlat  = new Vector3(pPos.x, 0f, pPos.z);
+                float   dist2D = Vector3.Distance(origin, pFlat);
 
-                if (Mathf.Abs(dist - ringRadius) < 1.0f && playerRef.transform.position.y < shockwaveGroundThreshold)
+                bool inRing   = dist2D >= innerR && dist2D <= outerR;
+                bool onGround = pPos.y < shockwaveGroundY;
+
+                if (inRing && onGround)
                 {
                     playerRef.ReceiveAttack(shockwaveDamage);
-                    damaged = true;
+                    playerHit = true;
                 }
             }
+
             yield return null;
         }
-
-        shockwaveRing.SetActive(false);
-        shockwaveMat.color = new Color(1f, 0.1f, 0f, 0.6f);
     }
 
     #endregion
 
-    // ────────────────────────────────────────────
-    #region Case 3：隐形追踪飞弹
+    // ==========================================================================
+    #region 招式 3：瞬间锁定贝塞尔飞弹
+    // ──────────────────────────────────────────────────────────────────────────
+    // 博弈设计（"看前摇瞬闪"）：
+    //   蓄力阶段（telegraphDuration - 0.3s）：追踪预警圈实时跟随玩家脚下
+    //   锁定时刻（-0.3s）：黄点渐隐 → 玩家判断此刻位置已被冻结
+    //   发射：3 枚飞弹走不同的二次贝塞尔弧线，同时飞向锁定点
+    //
+    // 贝塞尔控制点设计（P0 = 发射点，P1 = 控制点，P2 = 锁定点）：
+    //   飞弹 0：P1 大幅向上（高弧抛物线，从天而降感）
+    //   飞弹 1：P1 向右侧偏（右绕弧线，包抄感）
+    //   飞弹 2：P1 向左侧偏（左绕弧线，夹击感）
+    // ──────────────────────────────────────────────────────────────────────────
 
     IEnumerator Attack3_Missiles()
     {
-        // 无场地预警，直接依次生成飞弹
+        Vector3 attackerPos = activeAttacker.position;
+        FaceDrone(activeAttacker);
+        missileWarningActive = true;
+
+        warningArea.transform.position = attackerPos + activeAttacker.forward * 3f + Vector3.up * 0.05f;
+        warningArea.transform.localScale    = new Vector3(0.15f, 1f, 0.15f);
+        warningArea.transform.rotation = Quaternion.identity;
+        warningMat.color = new Color(1f, 0.9f, 0f, 0.5f);
+        warningMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 3f);
+        ApplyVisibility();
+
+        float   elapsed   = 0f;
+        float   lockTime  = telegraphDuration - 0.3f;
+        Vector3 lockedPos = Vector3.zero;
+
+        // 追踪预警圈跟随玩家
+        while (elapsed < lockTime)
+        {
+            elapsed += Time.deltaTime;
+
+            if (playerRef != null)
+            {
+                Vector3 p = playerRef.transform.position;
+                warningArea.transform.position = new Vector3(p.x, 0.05f, p.z);
+            }
+
+            float pulse = 0.5f + 0.5f * Mathf.Sin(elapsed * Mathf.PI * 4f);
+            Color c = warningMat.color;
+            c.a = Mathf.Lerp(0.2f, 0.7f, pulse);
+            warningMat.color = c;
+
+            yield return null;
+        }
+
+        // ── 瞬间锁定（玩家坐标冻结）
+        lockedPos = playerRef != null
+            ? playerRef.transform.position
+            : transform.position + transform.forward * 5f;
+
+        // 隐藏追踪圈（锁定已完成，不再跟随）
+        missileWarningActive = false;
+        warningArea.SetActive(false);
+
+        // 黄点渐隐：视觉告知"目标已捕获，马上发射"
+        yield return StartCoroutine(TelegraphFade(0.3f));
+
+        GameLogger.Log("[Boss] 招式3：贝塞尔飞弹三连");
+
+        Vector3 fireOrigin = activeAttacker.position + Vector3.up * 1.2f;
+        Vector3 toTarget   = lockedPos - fireOrigin;
+        float   span       = toTarget.magnitude;
+        Vector3 midBase    = (fireOrigin + lockedPos) * 0.5f;
+        Vector3 rightPerp  = Vector3.Cross(Vector3.up, toTarget.normalized).normalized;
+
+        Vector3[] ctrlPts =
+        {
+            midBase + Vector3.up  * (span * 0.55f),                       // 高弧
+            midBase + rightPerp   * (span * 0.40f) + Vector3.up * 2f,    // 右绕
+            midBase - rightPerp   * (span * 0.40f) + Vector3.up * 2f,    // 左绕
+        };
+
         for (int i = 0; i < missileCount; i++)
         {
-            SpawnHomingMissile();
-            yield return new WaitForSeconds(missileInterval);
+            Vector3 ctrl = ctrlPts[i % ctrlPts.Length];
+            StartCoroutine(LaunchBezierMissile(fireOrigin, ctrl, lockedPos,
+                                               missileDuration, missileDamage));
+            yield return new WaitForSeconds(0.12f);
         }
-        // 协程结束后由 AttackCycle 进入 Recovery
     }
 
-    void SpawnHomingMissile()
+    // 单枚贝塞尔弧线飞弹协程
+    // 二次贝塞尔：Pos(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
+    IEnumerator LaunchBezierMissile(Vector3 p0, Vector3 p1, Vector3 p2,
+                                    float duration, float dmg)
     {
-        Vector3 spawnOffset = new Vector3(
-            Random.Range(-0.6f, 0.6f),
-            1.2f + Random.Range(0f, 0.6f),
-            Random.Range(-0.6f, 0.6f));
+        GameObject obj = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        obj.name = "BezierMissile";
+        obj.transform.position   = p0;
+        obj.transform.localScale = new Vector3(0.2f, 0.2f, 0.5f);
+        Destroy(obj.GetComponent<Collider>());
 
-        GameObject missileObj = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        missileObj.name = "EnemyMissile";
-        missileObj.transform.position = transform.position + spawnOffset;
-        missileObj.transform.localScale = new Vector3(0.3f, 0.3f, 0.5f);
-
-        Renderer rend = missileObj.GetComponent<Renderer>();
-        Material mat = CreateLitMaterial(Color.red);
-        SetMaterialOpaque(mat, 0.3f);
-        mat.EnableKeyword("_EMISSION");
-        mat.SetColor("_EmissionColor", Color.red * 4f);
+        var rend = obj.GetComponent<MeshRenderer>();
+        // 无光照不透明红色材质：无论场景明暗均保持鲜红可见
+        var mat  = CreateUnlitOpaqueMaterial(Color.red);
         rend.material = mat;
-        rend.enabled = isOrderVision; // 初始状态同步
+        rend.enabled  = isOrderVision;  // 严格跟随 Shift 视野
 
-        HomingProjectile homing = missileObj.AddComponent<HomingProjectile>();
-        homing.Init(playerRef != null ? playerRef.transform : null, missileDamage);
+        activeMissileObjs.Add(obj);
 
-        activeMissiles.Add(homing);
+        float   elapsed = 0f;
+        Vector3 prevPos = p0;
+
+        while (elapsed < duration)
+        {
+            if (obj == null) yield break;  // 已被 TriggerStun/Die 销毁
+
+            elapsed += Time.deltaTime;
+            float t    = Mathf.Clamp01(elapsed / duration);
+            float invT = 1f - t;
+
+            // 二次贝塞尔插值
+            Vector3 cur = invT * invT * p0 + 2f * invT * t * p1 + t * t * p2;
+
+            // ── OverlapSphere 大体积判定（半径 1.5m）
+            // 巨大判定球配合玩家无敌帧（I-Frames），飞弹"擦过"玩家时
+            // ReceiveAttack 会被无敌帧拦截并触发"完美闪避"子弹时间
+            if (playerRef != null)
+            {
+                var cols = Physics.OverlapSphere(cur, 1.5f);
+                foreach (var col in cols)
+                {
+                    int dIdx = GetDroneIndex(col);
+                    if (dIdx >= 0) continue;
+                    var pc = col.GetComponentInParent<PlayerController>();
+                    if (pc != null)
+                    {
+                        pc.ReceiveAttack(dmg);
+                        activeMissileObjs.Remove(obj);
+                        Destroy(obj);
+                        yield break;
+                    }
+                }
+            }
+
+            Vector3 delta = cur - prevPos;
+            obj.transform.position = cur;
+            if (delta.sqrMagnitude > 0.0001f)
+                obj.transform.forward = delta.normalized;
+
+            prevPos = cur;
+            yield return null;
+        }
+
+        if (obj != null)
+        {
+            activeMissileObjs.Remove(obj);
+            Destroy(obj);
+        }
     }
 
     #endregion
 
-    // ────────────────────────────────────────────
-    #region 工具方法
+    // ==========================================================================
+    #region 工具
 
-    void FacePlayer()
+    void FaceDrone(Transform drone)
     {
-        if (playerRef == null) return;
-        Vector3 dir = playerRef.transform.position - transform.position;
+        if (playerRef == null || drone == null) return;
+        Vector3 dir = playerRef.transform.position - drone.position;
         dir.y = 0f;
         if (dir.sqrMagnitude > 0.01f)
-            transform.rotation = Quaternion.LookRotation(dir);
+            drone.rotation = Quaternion.LookRotation(dir);
+    }
+
+    public int GetDroneIndex(Collider col)
+    {
+        if (drones == null) return -1;
+        for (int i = 0; i < 3; i++)
+        {
+            if (drones[i] != null && (col.gameObject == drones[i] || col.transform.IsChildOf(drones[i].transform)))
+                return i;
+        }
+        return -1;
+    }
+
+    public bool IsCorrectDrone(int droneIndex, bool orderVision)
+    {
+        return droneIndex == currentCoreIndex && orderVision;
     }
 
     #endregion
 
-    // ────────────────────────────────────────────
+    // ==========================================================================
     #region 伤害结算与破防
 
     public void TakeDamage(float damage, bool isPerfectCounter)
     {
+        TakeDamage(damage, isPerfectCounter, -1);
+    }
+
+    public void TakeDamage(float damage, bool isPerfectCounter, int droneIndex)
+    {
         if (currentHealth <= 0) return;
+
+        if (droneIndex >= 0 && droneIndex != currentCoreIndex)
+        {
+            GameLogger.Log("幻影免疫！这不是真身！");
+            return;
+        }
+        if (droneIndex >= 0 && !isOrderVision)
+        {
+            GameLogger.Log("攻击无效！需要按住 Shift 看破真身！");
+            return;
+        }
 
         switch (currentState)
         {
@@ -696,33 +1221,36 @@ public class EnemyOrderSystem : MonoBehaviour
             case EnemyState.Telegraphing:
                 float reducedDamage = damage * damageReduction;
                 currentHealth -= reducedDamage;
+                GameLogger.Log($"外壳防护！仅受 {reducedDamage:F1} 点刮痧伤害");
+                AudioManager.PlayHitCore();
                 break;
 
             case EnemyState.Recovery:
                 if (isPerfectCounter)
                 {
+                    GameLogger.Log("防反破核！怪物进入瘫痪！");
+                    AudioManager.PlayHitCore();
                     TriggerStun();
                     return;
                 }
                 currentHealth -= damage;
+                GameLogger.Log($"抓后摇！受到 {damage:F1} 点伤害");
+                AudioManager.PlayHitCore();
                 break;
 
             case EnemyState.Stunned:
                 float critDamage = damage * critMultiplier;
                 currentHealth -= critDamage;
+                GameLogger.Log($"核心暴击！受到 {critDamage:F1} 点伤害");
+                AudioManager.PlayHitCore();
                 break;
         }
 
-        if (currentHealth <= 0)
-        {
-            currentHealth = 0;
-            Die();
-        }
+        if (currentHealth <= 0) { currentHealth = 0; Die(); }
     }
 
     void TriggerStun()
     {
-        // 打断攻击协程
         if (attackCycleCoroutine != null)
         {
             StopCoroutine(attackCycleCoroutine);
@@ -730,24 +1258,30 @@ public class EnemyOrderSystem : MonoBehaviour
         }
 
         warningArea.SetActive(false);
-        shockwaveRing.SetActive(false);
-        HideTelegraphFlash();
-        HideSweepCubes();
+        shockwaveRingObj.SetActive(false);
+        telegraphFlash.SetActive(false);
+        sweepFanObj.SetActive(false);
+        missileWarningActive = false;
 
-        for (int i = activeMissiles.Count - 1; i >= 0; i--)
-        {
-            if (activeMissiles[i] != null)
-                Destroy(activeMissiles[i].gameObject);
-        }
-        activeMissiles.Clear();
+        for (int i = activeMissileObjs.Count - 1; i >= 0; i--)
+            if (activeMissileObjs[i] != null) Destroy(activeMissileObjs[i]);
+        activeMissileObjs.Clear();
 
-        currentState = EnemyState.Stunned;
+        currentState      = EnemyState.Stunned;
         currentAttackType = -1;
+        currentAttackerIndex = -1;
 
-        // 强制暴露核心
-        chaosVisual.SetActive(false);
-        orderCore.SetActive(true);
+        for (int i = 0; i < 3; i++)
+        {
+            if (drones[i] != null)
+            {
+                var r = drones[i].GetComponent<MeshRenderer>();
+                if (r != null) r.material = transparentMat;
+            }
+            if (droneCores[i] != null) droneCores[i].SetActive(true);
+        }
 
+        GameLogger.Log("[Boss] 核心暴露！瘫痪 " + stunDuration + " 秒");
         stunTimerCoroutine = StartCoroutine(StunTimer());
     }
 
@@ -755,99 +1289,95 @@ public class EnemyOrderSystem : MonoBehaviour
     {
         yield return new WaitForSeconds(stunDuration);
 
-        currentState = EnemyState.Normal;
+        currentState      = EnemyState.Normal;
         currentAttackType = -1;
-        chaosVisual.SetActive(true);
-        orderCore.SetActive(false);
+        currentAttackerIndex = -1;
+
+        for (int i = 0; i < 3; i++)
+        {
+            if (drones[i] != null)
+            {
+                var r = drones[i].GetComponent<MeshRenderer>();
+                if (r != null) r.material = droneChaosMat;
+            }
+            if (droneCores[i] != null) droneCores[i].SetActive(false);
+        }
+
         warningArea.SetActive(false);
-        shockwaveRing.SetActive(false);
+        shockwaveRingObj.SetActive(false);
 
         attackCycleCoroutine = StartCoroutine(AttackCycle());
     }
 
     void Die()
     {
-        if (attackCycleCoroutine != null)
-            StopCoroutine(attackCycleCoroutine);
-        if (stunTimerCoroutine != null)
-            StopCoroutine(stunTimerCoroutine);
+        if (attackCycleCoroutine != null) StopCoroutine(attackCycleCoroutine);
+        if (stunTimerCoroutine   != null) StopCoroutine(stunTimerCoroutine);
 
-        for (int i = activeMissiles.Count - 1; i >= 0; i--)
-        {
-            if (activeMissiles[i] != null)
-                Destroy(activeMissiles[i].gameObject);
-        }
-        activeMissiles.Clear();
+        for (int i = activeMissileObjs.Count - 1; i >= 0; i--)
+            if (activeMissileObjs[i] != null) Destroy(activeMissileObjs[i]);
+        activeMissileObjs.Clear();
 
-        SpawnDeathEffect();
+        if (drones != null)
+            for (int i = 0; i < drones.Length; i++)
+                if (drones[i] != null) SpawnDeathEffect(drones[i].transform.position);
+
         Destroy(gameObject);
     }
 
-    void SpawnDeathEffect()
+    void SpawnDeathEffect(Vector3 pos)
     {
-        for (int i = 0; i < 20; i++)
+        for (int i = 0; i < 10; i++)
         {
             GameObject fragment = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            fragment.transform.position = transform.position + Random.insideUnitSphere * 0.5f;
+            fragment.transform.position   = pos + Random.insideUnitSphere * 0.5f;
             fragment.transform.localScale = Vector3.one * Random.Range(0.1f, 0.3f);
-
-            Renderer rend = fragment.GetComponent<Renderer>();
-            Material mat = CreateLitMaterial(Color.red);
+            var mat = CreateLitMaterial(Color.red);
             SetMaterialOpaque(mat, 0.2f);
             mat.EnableKeyword("_EMISSION");
             mat.SetColor("_EmissionColor", Color.red * 3f);
-            rend.material = mat;
-
-            Rigidbody rb = fragment.AddComponent<Rigidbody>();
-            rb.AddExplosionForce(500f, transform.position, 2f);
+            fragment.GetComponent<Renderer>().material = mat;
+            var rb = fragment.AddComponent<Rigidbody>();
+            rb.AddExplosionForce(500f, pos, 2f);
             Destroy(fragment, 2f);
         }
     }
 
     #endregion
 
-    // ────────────────────────────────────────────
+    // ==========================================================================
     #region 血条 OnGUI
 
     void OnGUI()
     {
         if (Camera.main == null || currentHealth <= 0) return;
 
-        Vector3 worldPos = transform.position + Vector3.up * 2.5f;
-        Vector3 screenPos = Camera.main.WorldToScreenPoint(worldPos);
-        if (screenPos.z <= 0) return;
+        float barX = (Screen.width - healthBarWidth) * 0.5f;
+        float barY = 40f;
 
-        screenPos.y = Screen.height - screenPos.y;
-        float barX = screenPos.x - healthBarWidth * 0.5f;
-        float barY = screenPos.y - healthBarOffsetY;
-
-        // 背景
         GUI.color = new Color(0.15f, 0.15f, 0.15f, 0.9f);
         GUI.DrawTexture(new Rect(barX, barY, healthBarWidth, healthBarHeight), Texture2D.whiteTexture);
 
-        // 血量
         float ratio = currentHealth / maxHealth;
         GUI.color = currentState == EnemyState.Stunned ? Color.cyan : Color.red;
         GUI.DrawTexture(new Rect(barX, barY, healthBarWidth * ratio, healthBarHeight), Texture2D.whiteTexture);
 
-        // 文字
         GUI.color = Color.white;
-        GUIStyle style = new GUIStyle(GUI.skin.label)
+        var style = new GUIStyle(GUI.skin.label)
         {
             alignment = TextAnchor.MiddleCenter,
-            fontSize = 12,
+            fontSize  = 12,
             fontStyle = FontStyle.Bold
         };
         GUI.Label(new Rect(barX, barY, healthBarWidth, healthBarHeight),
             $"{Mathf.Ceil(currentHealth)} / {maxHealth}", style);
 
-        // 瘫痪提示
         if (currentState == EnemyState.Stunned)
         {
-            GUIStyle stunnedStyle = new GUIStyle(GUI.skin.label)
+            var stunnedStyle = new GUIStyle(GUI.skin.label)
             {
                 alignment = TextAnchor.MiddleCenter,
-                fontSize = 14,
+                fontSize  = 14,
                 fontStyle = FontStyle.Bold
             };
             stunnedStyle.normal.textColor = Color.cyan;

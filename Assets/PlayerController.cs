@@ -1,5 +1,6 @@
 using System.Collections;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 [RequireComponent(typeof(CharacterController))]
 public class PlayerController : MonoBehaviour
@@ -11,7 +12,7 @@ public class PlayerController : MonoBehaviour
     public float mouseSensitivity = 2f;
     public float dodgeSpeed = 6f;
     public float dodgeDuration = 0.15f;
-    public float postDodgeInvincibleDuration = 0.6f;
+    public float invincibleDuration = 0.35f;
     public float groundStickForce = -50f;
     public float coyoteTime = 0.12f;
 
@@ -35,13 +36,18 @@ public class PlayerController : MonoBehaviour
     private float lastGroundedTime;
     private bool isInvincible;
     private bool hasPerfectDodgeBuff;
-    private bool postDodgeInvincible;
+    private bool isWitchTime;
+    private bool isDead;
+    private GUIStyle deathButtonStyle;
+    private float dodgeFlashTimer;
+    private const float dodgeFlashDuration = 0.2f;
+    private float dodgeBufferTimer;
 
     void Awake()
     {
         dodgeSpeed = 6f;
         dodgeDuration = 0.15f;
-        postDodgeInvincibleDuration = 0.6f;
+        invincibleDuration = 0.5f;
     }
 
     void Start()
@@ -119,6 +125,17 @@ public class PlayerController : MonoBehaviour
 
     void Update()
     {
+        if (isDead) return;
+
+        if (dodgeFlashTimer > 0f)
+            dodgeFlashTimer -= Time.deltaTime;
+
+        if (dodgeBufferTimer > 0f)
+            dodgeBufferTimer -= Time.deltaTime;
+
+        if (Input.GetMouseButtonDown(1) && !Input.GetKey(KeyCode.LeftShift))
+            dodgeBufferTimer = 0.15f;
+
         HandleEnemyOrder();
 
         HandleMouseLook();
@@ -195,8 +212,9 @@ public class PlayerController : MonoBehaviour
 
     void HandleDodge()
     {
-        if (Input.GetMouseButtonDown(1) && controller.isGrounded && !isDodging && currentStamina >= dodgeCost)
+        if (dodgeBufferTimer > 0f && !Input.GetKey(KeyCode.LeftShift) && controller.isGrounded && !isDodging && currentStamina >= dodgeCost)
         {
+            dodgeBufferTimer = 0f;
             currentStamina -= dodgeCost;
             StartCoroutine(DodgeBackward());
         }
@@ -206,7 +224,6 @@ public class PlayerController : MonoBehaviour
     {
         isDodging = true;
         isInvincible = true;
-        postDodgeInvincible = false;
         float elapsed = 0f;
 
         while (elapsed < dodgeDuration)
@@ -218,37 +235,61 @@ public class PlayerController : MonoBehaviour
 
         isDodging = false;
 
-        if (postDodgeInvincible)
-        {
-            yield return new WaitForSeconds(postDodgeInvincibleDuration);
-        }
+        float remainTime = invincibleDuration - dodgeDuration;
+        if (remainTime > 0f)
+            yield return new WaitForSeconds(remainTime);
 
         isInvincible = false;
-        postDodgeInvincible = false;
     }
 
     public void ReceiveAttack(float damage)
     {
+        if (isDead) return;
         if (isInvincible)
         {
             hasPerfectDodgeBuff = true;
-            postDodgeInvincible = true;
-            StartCoroutine(PerfectDodgeBuffTimer());
+            dodgeFlashTimer = dodgeFlashDuration;
+            GameLogger.Log("完美闪避！触发子弹时间！");
+            AudioManager.PlayPerfectDodge();
+            StartCoroutine(PerfectDodgeFeedback());
             return;
         }
 
         playerCurrentHealth -= damage;
+        GameLogger.Log($"玩家受到 {damage:F1} 点伤害！剩余血量: {playerCurrentHealth:F0}");
 
         if (playerCurrentHealth <= 0)
         {
             playerCurrentHealth = 0;
+            Die();
         }
     }
 
-    IEnumerator PerfectDodgeBuffTimer()
+    void Die()
     {
+        isDead = true;
+        Time.timeScale = 0f;
+        Cursor.lockState = CursorLockMode.None;
+        Cursor.visible = true;
+        GameLogger.Log("玩家阵亡！");
+    }
+
+    public bool IsDead()
+    {
+        return isDead;
+    }
+
+    IEnumerator PerfectDodgeFeedback()
+    {
+        isWitchTime = true;
+        Time.timeScale = 0.2f;
+        yield return new WaitForSecondsRealtime(0.5f);
+        Time.timeScale = 1f;
+        isWitchTime = false;
+
         yield return new WaitForSeconds(2f);
         hasPerfectDodgeBuff = false;
+        GameLogger.Log("防反破核Buff已消失");
     }
 
     void HandleShoot()
@@ -281,8 +322,28 @@ public class PlayerController : MonoBehaviour
         bulletBehaviour.Init(10f, hasPerfectDodgeBuff);
     }
 
+    void InitDeathButtonStyle()
+    {
+        if (deathButtonStyle != null) return;
+        deathButtonStyle = new GUIStyle(GUI.skin.button);
+        deathButtonStyle.fontSize = 22;
+        deathButtonStyle.fontStyle = FontStyle.Bold;
+        deathButtonStyle.normal.textColor = Color.white;
+        deathButtonStyle.normal.background = Texture2D.whiteTexture;
+        deathButtonStyle.hover.textColor = Color.cyan;
+        deathButtonStyle.hover.background = Texture2D.whiteTexture;
+        deathButtonStyle.active.textColor = Color.yellow;
+        deathButtonStyle.alignment = TextAnchor.MiddleCenter;
+    }
+
     void OnGUI()
     {
+        if (isDead)
+        {
+            DrawDeathUI();
+            return;
+        }
+
         float crosshairSize = 20f;
         float crosshairThickness = 2f;
         float cx = Screen.width * 0.5f;
@@ -291,6 +352,20 @@ public class PlayerController : MonoBehaviour
         GUI.color = Color.white;
         GUI.DrawTexture(new Rect(cx - crosshairSize * 0.5f, cy - crosshairThickness * 0.5f, crosshairSize, crosshairThickness), Texture2D.whiteTexture);
         GUI.DrawTexture(new Rect(cx - crosshairThickness * 0.5f, cy - crosshairSize * 0.5f, crosshairThickness, crosshairSize), Texture2D.whiteTexture);
+
+        if (dodgeFlashTimer > 0f)
+        {
+            Vector3 playerScreen = mainCamera.WorldToScreenPoint(transform.position + Vector3.up * 0.5f);
+            if (playerScreen.z > 0f)
+            {
+                float flashAlpha = dodgeFlashTimer / dodgeFlashDuration;
+                float flashRadius = Mathf.Lerp(30f, 80f, 1f - flashAlpha);
+                float px = playerScreen.x;
+                float py = Screen.height - playerScreen.y;
+                GUI.color = new Color(1f, 1f, 1f, flashAlpha * 0.7f);
+                GUI.DrawTexture(new Rect(px - flashRadius, py - flashRadius, flashRadius * 2f, flashRadius * 2f), Texture2D.whiteTexture);
+            }
+        }
 
         float healthX = 20f;
         float healthY = Screen.height - 30f;
@@ -337,5 +412,52 @@ public class PlayerController : MonoBehaviour
         }
 
         GUI.color = Color.white;
+    }
+
+    void DrawDeathUI()
+    {
+        InitDeathButtonStyle();
+
+        GUI.color = new Color(0.2f, 0.2f, 0.2f, 0.6f);
+        GUI.DrawTexture(new Rect(0, 0, Screen.width, Screen.height), Texture2D.whiteTexture);
+        GUI.color = Color.white;
+
+        GUIStyle titleStyle = new GUIStyle(GUI.skin.label);
+        titleStyle.fontSize = 120;
+        titleStyle.fontStyle = FontStyle.Bold;
+        titleStyle.alignment = TextAnchor.MiddleCenter;
+        titleStyle.normal.textColor = Color.red;
+
+        float titleY = Screen.height * 0.25f;
+        GUI.Label(new Rect(0, titleY, Screen.width, 150f), "卡 了", titleStyle);
+
+        float btnWidth = 220f;
+        float btnHeight = 50f;
+        float btnX = (Screen.width - btnWidth) * 0.5f;
+        float btnStartY = Screen.height * 0.55f;
+        float spacing = 25f;
+
+        GUI.color = new Color(0.2f, 0.2f, 0.2f, 0.9f);
+        GUI.DrawTexture(new Rect(btnX, btnStartY, btnWidth, btnHeight), Texture2D.whiteTexture);
+        GUI.DrawTexture(new Rect(btnX, btnStartY + btnHeight + spacing, btnWidth, btnHeight), Texture2D.whiteTexture);
+        GUI.color = Color.white;
+
+        GUI.contentColor = Color.black;
+
+        if (GUI.Button(new Rect(btnX, btnStartY, btnWidth, btnHeight), "重新开始", deathButtonStyle))
+        {
+            isDead = false;
+            Time.timeScale = 1f;
+            SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
+        }
+
+        if (GUI.Button(new Rect(btnX, btnStartY + btnHeight + spacing, btnWidth, btnHeight), "返回菜单", deathButtonStyle))
+        {
+            isDead = false;
+            Time.timeScale = 1f;
+            SceneManager.LoadScene(0);
+        }
+
+        GUI.contentColor = Color.white;
     }
 }

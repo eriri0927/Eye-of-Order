@@ -12,6 +12,9 @@ public class GameManager : MonoBehaviour
     {
         if (Input.GetKeyDown(KeyCode.Escape))
         {
+            PlayerController player = FindObjectOfType<PlayerController>();
+            if (player != null && player.IsDead()) return;
+
             isPaused = !isPaused;
 
             if (isPaused)
@@ -20,7 +23,6 @@ public class GameManager : MonoBehaviour
                 Cursor.lockState = CursorLockMode.None;
                 Cursor.visible = true;
 
-                PlayerController player = FindObjectOfType<PlayerController>();
                 if (player != null) player.enabled = false;
             }
             else

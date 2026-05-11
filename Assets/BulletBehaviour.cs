@@ -39,9 +39,15 @@ public class BulletBehaviour : MonoBehaviour
 
             SpawnImpact(hits[i].point);
 
-            EnemyOrderSystem enemy = hits[i].collider.GetComponentInParent<EnemyOrderSystem>();
+            EnemyOrderSystem enemy = FindObjectOfType<EnemyOrderSystem>();
             if (enemy != null)
-                enemy.TakeDamage(damage, isPerfectCounter);
+            {
+                int droneIdx = enemy.GetDroneIndex(hits[i].collider);
+                if (droneIdx >= 0)
+                    enemy.TakeDamage(damage, isPerfectCounter, droneIdx);
+                else
+                    enemy.TakeDamage(damage, isPerfectCounter);
+            }
 
             Destroy(gameObject);
             return;

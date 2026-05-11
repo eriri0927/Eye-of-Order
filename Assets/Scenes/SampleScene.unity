@@ -451,6 +451,7 @@ MonoBehaviour:
   mouseSensitivity: 2
   dodgeSpeed: 40
   dodgeDuration: 0.2
+  invincibleDuration: 0.35
   groundStickForce: -50
   coyoteTime: 0.12
   maxStamina: 100
@@ -511,6 +512,7 @@ GameObject:
   m_Component:
   - component: {fileID: 1223916096}
   - component: {fileID: 1223916095}
+  - component: {fileID: 1223916097}
   m_Layer: 0
   m_Name: GameManager
   m_TagString: Untagged
@@ -545,6 +547,18 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1223916097
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1223916094}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 42c7ab26a66333e4caaec7fb99bae194, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
 --- !u!1 &2131652688
 GameObject:
   m_ObjectHideFlags: 0
@@ -582,14 +596,21 @@ MonoBehaviour:
   damageReduction: 0.1
   critMultiplier: 2
   chargeSpeed: 18
+  chargeDuration: 0.3
   chargeDamage: 40
-  sweepRange: 3
+  chargeLength: 8
+  chargeHalfWidth: 1
+  sweepRadius: 4.5
+  sweepHalfAngle: 90
   sweepDamage: 30
-  shockwaveRadius: 10
+  shockwaveMaxRadius: 8
+  shockwaveExpandTime: 1
+  shockwaveRingThickness: 1.5
   shockwaveDamage: 35
-  missileDamage: 15
+  shockwaveGroundY: 1.5
   missileCount: 4
-  missileInterval: 0.3
+  missileDamage: 15
+  missileDuration: 0.7
   healthBarWidth: 200
   healthBarHeight: 20
   healthBarOffsetY: 50
