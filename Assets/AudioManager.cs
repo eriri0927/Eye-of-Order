@@ -31,27 +31,27 @@ public class AudioManager : MonoBehaviour
 
     public static void PlayDodge()
     {
-        Play(dodgeClip);
+        Play(Instance.dodgeClip);
     }
 
     public static void PlayPerfectDodge()
     {
-        Play(perfectDodgeClip);
+        Play(Instance.perfectDodgeClip);
     }
 
     public static void PlayFire()
     {
-        Play(fireClip);
+        Play(Instance.fireClip);
     }
 
     public static void PlayHitCore()
     {
-        Play(hitCoreClip);
+        Play(Instance.hitCoreClip);
     }
 
     public static void PlayWarning()
     {
-        Play(warningClip);
+        Play(Instance.warningClip);
     }
 
     static void Play(AudioClip clip)

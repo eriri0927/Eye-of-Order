@@ -12,6 +12,7 @@ using System.Collections;
 using System.Collections.Generic;
 
 public enum EnemyState { Normal, Telegraphing, Recovery, Stunned }
+public enum BossPhase { Phase1, Transitioning, Phase2 }
 
 public class EnemyOrderSystem : MonoBehaviour
 {
@@ -81,26 +82,42 @@ public class EnemyOrderSystem : MonoBehaviour
     private Material         droneCoreMat;
     private int              currentCoreIndex   = -1;
     private Material         transparentMat;
+    private Vector3[]        droneBasePositions;
     private const float      orbitRadius   = 8f;
     private const float      orbitBaseY    = 0.5f;
-    private const float      orbitSpeed    = 10f;
-    private float            coreShiftTimer;
+    private const float      attackScale   = 1.8f;
+
+    private struct DronePatrol
+    {
+        public Vector3 moveDirection;
+        public float   stateTimer;
+        public bool    isMoving;
+    }
+    private DronePatrol[] patrolStates;
+    private const float patrolSpeed   = 3f;
+    private const float patrolMinDist = 3f;
+    private const float patrolMaxDist = 12f;
 
     // ──────────────────────────── 状态 ────────────────────────────────────────
     private bool       useURP;
     private EnemyState currentState      = EnemyState.Normal;
-    private bool       isOrderVision     = false;
+    private bool       isOrderVision     = false;  // 由 playerRef.CanPierceCore 驱动
     private int        currentAttackType = -1;
     private int        currentAttackerIndex = -1;
+    private float      hitCooldown = 0f;
     private Transform  activeAttacker;
 
     private Coroutine attackCycleCoroutine;
     private Coroutine stunTimerCoroutine;
+    private Coroutine phaseSplitCoroutine;
 
     private PlayerController       playerRef;
     private List<GameObject>       activeMissileObjs = new List<GameObject>();
 
     private bool missileWarningActive = false;
+    private bool phaseSplitTriggered = false;
+
+    public BossPhase currentPhase = BossPhase.Phase1;
 
     private GameObject CurrentCoreDrone   => (drones != null && currentCoreIndex >= 0 && currentCoreIndex < 3) ? drones[currentCoreIndex] : null;
     private GameObject CurrentAttackerDrone => (drones != null && currentAttackerIndex >= 0 && currentAttackerIndex < 3) ? drones[currentAttackerIndex] : null;
@@ -118,7 +135,16 @@ public class EnemyOrderSystem : MonoBehaviour
         shockwaveMaxRadius = 8f;  shockwaveExpandTime = 1f;
         shockwaveRingThickness = 1.5f;  shockwaveDamage = 35f; shockwaveGroundY = 1.5f;
         missileCount = 3;   missileDamage = 15f;    missileDuration = 0.7f;
-        coreShiftTimer = Random.Range(5f, 8f);
+
+        currentPhase = BossPhase.Phase1;
+        phaseSplitTriggered = false;
+
+        chargeLength           *= attackScale;
+        chargeHalfWidth        *= attackScale;
+        sweepRadius            *= attackScale;
+        shockwaveMaxRadius     *= attackScale;
+        shockwaveRingThickness *= attackScale;
+        shockwaveGroundY       *= attackScale;
     }
 
     // ─────────────────────────────── Start ────────────────────────────────────
@@ -137,19 +163,87 @@ public class EnemyOrderSystem : MonoBehaviour
         SetInitialVisuals();
 
         attackCycleCoroutine = StartCoroutine(AttackCycle());
-        StartCoroutine(OrbitDrones());
-        StartCoroutine(CoreShiftCycle());
+    }
+
+    void CheckPhaseSplit()
+    {
+        if (currentPhase == BossPhase.Phase1 && !phaseSplitTriggered && currentHealth <= maxHealth * 0.5f)
+        {
+            phaseSplitTriggered = true;
+            currentPhase = BossPhase.Transitioning;
+            if (phaseSplitCoroutine != null) StopCoroutine(phaseSplitCoroutine);
+            phaseSplitCoroutine = StartCoroutine(PhaseSplitRoutine());
+        }
+    }
+
+    IEnumerator PhaseSplitRoutine()
+    {
+        if (attackCycleCoroutine != null)
+        {
+            StopCoroutine(attackCycleCoroutine);
+            attackCycleCoroutine = null;
+        }
+        if (stunTimerCoroutine != null)
+        {
+            StopCoroutine(stunTimerCoroutine);
+            stunTimerCoroutine = null;
+        }
+
+        warningArea.SetActive(false);
+        shockwaveRingObj.SetActive(false);
+        telegraphFlash.SetActive(false);
+        sweepFanObj.SetActive(false);
+        missileWarningActive = false;
+        for (int i = activeMissileObjs.Count - 1; i >= 0; i--)
+            if (activeMissileObjs[i] != null) Destroy(activeMissileObjs[i]);
+        activeMissileObjs.Clear();
+
+        currentState      = EnemyState.Normal;
+        currentAttackType = -1;
+        currentAttackerIndex = -1;
+
+        if (playerRef != null) playerRef.isTransitionFrozen = true;
+
+        yield return new WaitForSeconds(1f);
+
+        drones[0].transform.localScale = Vector3.one * 1.5f;
+
+        for (int i = 1; i < 3; i++)
+        {
+            drones[i].SetActive(true);
+            drones[i].transform.position = droneBasePositions[i];
+        }
+
+        yield return new WaitForSeconds(1f);
+
+        if (playerRef != null) playerRef.isTransitionFrozen = false;
+
+        currentPhase = BossPhase.Phase2;
+        currentCoreIndex = Random.Range(0, 3);
+
+        for (int i = 0; i < 3; i++)
+        {
+            patrolStates[i].moveDirection = new Vector3(Random.Range(-1f, 1f), 0f, Random.Range(-1f, 1f)).normalized;
+            patrolStates[i].stateTimer    = Random.Range(1f, 2f);
+            patrolStates[i].isMoving      = false;
+        }
+
+        ApplyVisibility();
+        attackCycleCoroutine = StartCoroutine(AttackCycle());
+        GameLogger.Log("[Boss] 血量降至 50%！Boss进入第二阶段！");
     }
 
     // ─────────────────────────────── Update ───────────────────────────────────
     void Update()
     {
+        if (hitCooldown > 0f) hitCooldown -= Time.deltaTime;
+
         // ── Drone 核心视觉同步
         if (drones != null && droneCores != null)
         {
             for (int i = 0; i < 3; i++)
             {
-                if (drones[i] == null) continue;
+                if (drones[i] == null || !drones[i].activeSelf) continue;
                 bool isCore = (i == currentCoreIndex);
                 var rend = drones[i].GetComponent<MeshRenderer>();
                 if (rend != null)
@@ -170,8 +264,81 @@ public class EnemyOrderSystem : MonoBehaviour
                 var coreRend = droneCores[i].GetComponent<MeshRenderer>();
                 if (coreRend != null)
                 {
-                    bool showCore = (currentState == EnemyState.Stunned) || (isOrderVision && isCore);
+                    bool showCore = currentState != EnemyState.Normal && isOrderVision && isCore;
                     coreRend.enabled = showCore;
+                }
+            }
+        }
+
+        // ── Drone 独立巡逻（狼群走停） + 每帧 LookAt + Y 轴锁定
+        if (drones != null && playerRef != null && patrolStates != null)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                if (drones[i] == null || !drones[i].activeSelf) continue;
+                Vector3 lookTarget = new Vector3(
+                    playerRef.transform.position.x,
+                    drones[i].transform.position.y,
+                    playerRef.transform.position.z);
+                if ((lookTarget - drones[i].transform.position).sqrMagnitude > 0.01f)
+                    drones[i].transform.LookAt(lookTarget);
+
+                // 冲锋中的 drone 由攻击协程控制，仅锁定 Y，不执行巡逻
+                bool isAttacker = (currentState == EnemyState.Telegraphing && i == currentAttackerIndex);
+                if (isAttacker)
+                {
+                    Vector3 aPos = drones[i].transform.position;
+                    drones[i].transform.position = new Vector3(aPos.x, orbitBaseY, aPos.z);
+                    continue;
+                }
+
+                // 独立巡逻计时器倒计时
+                patrolStates[i].stateTimer -= Time.deltaTime;
+                if (patrolStates[i].stateTimer <= 0f)
+                {
+                    patrolStates[i].isMoving = !patrolStates[i].isMoving;
+                    if (patrolStates[i].isMoving)
+                    {
+                        patrolStates[i].moveDirection = new Vector3(Random.Range(-1f, 1f), 0f, Random.Range(-1f, 1f)).normalized;
+                        patrolStates[i].stateTimer    = Random.Range(2f, 3f);
+                    }
+                    else
+                    {
+                        patrolStates[i].stateTimer = Random.Range(1f, 2f);
+                    }
+                }
+
+                // 移动状态：沿 moveDirection 行进
+                if (patrolStates[i].isMoving)
+                {
+                    Vector3 newPos = drones[i].transform.position + patrolStates[i].moveDirection * patrolSpeed * Time.deltaTime;
+                    newPos.y = orbitBaseY;
+                    drones[i].transform.position = newPos;
+
+                    // 防逃逸距离检测：超出 12m 或小于 3m 触发 120° 折返
+                    float distToPlayer = Vector3.Distance(drones[i].transform.position, playerRef.transform.position);
+                    if (distToPlayer > patrolMaxDist || distToPlayer < patrolMinDist)
+                    {
+                        patrolStates[i].moveDirection = Quaternion.Euler(0f, 120f, 0f) * patrolStates[i].moveDirection;
+                    }
+
+                    // 同伴避让：与其他 drone 过近时也 120° 折返
+                    for (int j = 0; j < 3; j++)
+                    {
+                        if (j == i || drones[j] == null) continue;
+                        float distToOther = Vector3.Distance(drones[i].transform.position, drones[j].transform.position);
+                        if (distToOther < 3f)
+                        {
+                            patrolStates[i].moveDirection = Quaternion.Euler(0f, 120f, 0f) * patrolStates[i].moveDirection;
+                            break;
+                        }
+                    }
+                }
+
+                // Y 轴强制锁定
+                {
+                    Vector3 pos = drones[i].transform.position;
+                    drones[i].transform.position = new Vector3(pos.x, orbitBaseY, pos.z);
                 }
             }
         }
@@ -405,11 +572,16 @@ public class EnemyOrderSystem : MonoBehaviour
         drones    = new GameObject[3];
         droneCores = new GameObject[3];
 
+        Vector3 pPos = playerRef.transform.position;
+        droneBasePositions = new Vector3[3];
+        droneBasePositions[0] = pPos + playerRef.transform.forward * 10f;
+        droneBasePositions[1] = pPos + (-playerRef.transform.forward * 0.5f - playerRef.transform.right * 0.866f) * 10f;
+        droneBasePositions[2] = pPos + (-playerRef.transform.forward * 0.5f + playerRef.transform.right * 0.866f) * 10f;
+        for (int j = 0; j < 3; j++) droneBasePositions[j].y = orbitBaseY;
+
         for (int i = 0; i < 3; i++)
         {
-            float angle = i * 120f;
-            float rad   = angle * Mathf.Deg2Rad;
-            Vector3 pos = transform.position + new Vector3(Mathf.Cos(rad) * orbitRadius, orbitBaseY, Mathf.Sin(rad) * orbitRadius);
+            Vector3 pos = droneBasePositions[i];
 
             GameObject drone = GameObject.CreatePrimitive(PrimitiveType.Cube);
             drone.name = "Drone_" + i;
@@ -421,7 +593,19 @@ public class EnemyOrderSystem : MonoBehaviour
             CreateDroneCore(i);
         }
 
-        currentCoreIndex = Random.Range(0, 3);
+        // P1：只激活 Drone_0 作为巨物压迫
+        drones[0].transform.localScale = Vector3.one * 3f;
+        for (int i = 1; i < 3; i++) drones[i].SetActive(false);
+
+        currentCoreIndex = 0;
+
+        patrolStates = new DronePatrol[3];
+        for (int i = 0; i < 3; i++)
+        {
+            patrolStates[i].moveDirection = new Vector3(Random.Range(-1f, 1f), 0f, Random.Range(-1f, 1f)).normalized;
+            patrolStates[i].stateTimer    = Random.Range(1f, 2f);
+            patrolStates[i].isMoving      = false;
+        }
     }
 
     void CreateDroneCore(int index)
@@ -479,7 +663,7 @@ public class EnemyOrderSystem : MonoBehaviour
         telegraphFlash.name = "telegraphFlash";
         telegraphFlash.transform.SetParent(transform);
         telegraphFlash.transform.localPosition = new Vector3(0f, 1f, 0f);
-        telegraphFlash.transform.localScale    = Vector3.one * 0.5f;
+        telegraphFlash.transform.localScale    = Vector3.one * 0.5f * attackScale;
         flashMat = CreateLitMaterial(Color.yellow);
         flashMat.EnableKeyword("_EMISSION");
         flashMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 10f);
@@ -510,8 +694,16 @@ public class EnemyOrderSystem : MonoBehaviour
     void SetInitialVisuals()
     {
         if (drones != null)
+        {
             for (int i = 0; i < drones.Length; i++)
-                if (drones[i] != null) drones[i].SetActive(true);
+            {
+                if (drones[i] == null) continue;
+                if (currentPhase == BossPhase.Phase1 && i != 0)
+                    drones[i].SetActive(false);
+                else
+                    drones[i].SetActive(true);
+            }
+        }
         warningArea.SetActive(false);
         shockwaveRingObj.SetActive(false);
         sweepFanObj.SetActive(false);
@@ -520,11 +712,11 @@ public class EnemyOrderSystem : MonoBehaviour
     #endregion
 
     // ==========================================================================
-    #region 视野切换（Shift 显隐铁律）
+    #region 视野切换（破核权限驱动显隐）
 
-    public void SwitchToOrder(bool isOrder)
+    public void SwitchToOrder(bool canPierce)
     {
-        isOrderVision = isOrder;
+        isOrderVision = canPierce;
         ApplyVisibility();
     }
 
@@ -537,12 +729,13 @@ public class EnemyOrderSystem : MonoBehaviour
             case EnemyState.Stunned:
                 for (int i = 0; i < 3; i++)
                 {
+                    bool isCore = (i == currentCoreIndex);
                     if (drones[i] != null)
                     {
                         var r = drones[i].GetComponent<MeshRenderer>();
-                        if (r != null) r.material = transparentMat;
+                        if (r != null) r.material = (isOrderVision && isCore) ? transparentMat : droneChaosMat;
                     }
-                    if (droneCores[i] != null) droneCores[i].SetActive(true);
+                    if (droneCores[i] != null) droneCores[i].SetActive(isOrderVision && isCore);
                 }
                 warningArea.SetActive(false);
                 shockwaveRingObj.SetActive(false);
@@ -623,12 +816,26 @@ public class EnemyOrderSystem : MonoBehaviour
             ApplyVisibility();
             yield return new WaitForSeconds(waitDuration);
 
-            currentAttackType = Random.Range(0, 4);
-            currentState      = EnemyState.Telegraphing;
-
-            currentAttackerIndex = Random.Range(0, 3);
+            currentAttackerIndex = (currentPhase == BossPhase.Phase1) ? 0 : Random.Range(0, 3);
             activeAttacker = (drones != null && currentAttackerIndex >= 0 && currentAttackerIndex < 3)
                 ? drones[currentAttackerIndex].transform : transform;
+
+            currentAttackType = Random.Range(0, 4);
+            if (currentAttackType == 1 && playerRef != null)
+            {
+                float distToPlayer = Vector3.Distance(activeAttacker.position, playerRef.transform.position);
+                if (distToPlayer > sweepRadius + 2f)
+                    currentAttackType = Random.Range(0, 2) == 0 ? 0 : 2;
+            }
+
+            currentState = EnemyState.Telegraphing;
+
+            if (currentPhase != BossPhase.Phase1)
+            {
+                int newCore;
+                do { newCore = Random.Range(0, 3); } while (newCore == currentCoreIndex && Random.value > 0.3f);
+                currentCoreIndex = newCore;
+            }
 
             switch (currentAttackType)
             {
@@ -647,44 +854,11 @@ public class EnemyOrderSystem : MonoBehaviour
     #endregion
 
     // ==========================================================================
-    #region 三体幻影：环绕与核心轮转
+    #region 三体幻影：核心轮转
 
-    IEnumerator OrbitDrones()
-    {
-        while (true)
-        {
-            if (drones != null && playerRef != null)
-            {
-                Vector3 center = playerRef.transform.position;
-                for (int i = 0; i < 3; i++)
-                {
-                    if (drones[i] == null) continue;
-                    float baseAngle = i * 120f;
-                    float angle = baseAngle + Time.time * orbitSpeed;
-                    float rad   = angle * Mathf.Deg2Rad;
-                    Vector3 targetPos = center + new Vector3(Mathf.Cos(rad) * orbitRadius, orbitBaseY, Mathf.Sin(rad) * orbitRadius);
-                    drones[i].transform.position = Vector3.Lerp(drones[i].transform.position, targetPos, Time.deltaTime * 2f);
-                }
-            }
-            yield return null;
-        }
-    }
-
-    IEnumerator CoreShiftCycle()
-    {
-        while (true)
-        {
-            yield return new WaitForSeconds(coreShiftTimer);
-
-            int newIndex;
-            do { newIndex = Random.Range(0, 3); } while (newIndex == currentCoreIndex && Random.value > 0.3f);
-            currentCoreIndex = newIndex;
-            coreShiftTimer = Random.Range(5f, 8f);
-
-            if (isOrderVision)
-                GameLogger.Log($"[Core Shift] 真身转移到 Drone {currentCoreIndex}");
-        }
-    }
+    // ─────────────────────────────────────────────────────────────────────────
+    // 真身轮转已移至 AttackCycle() 的前摇阶段：每次发动攻击时随机更换真身。
+    // ─────────────────────────────────────────────────────────────────────────
 
     #endregion
 
@@ -744,6 +918,8 @@ public class EnemyOrderSystem : MonoBehaviour
         warningMat.color = new Color(1f, 0.9f, 0f, 0.45f);
         warningMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 3f);
         ApplyVisibility();
+        // 破核权限隔离：CanPierceCore（Shift 或子弹时间）才允许听到预警
+        if (playerRef != null && playerRef.CanPierceCore) AudioManager.PlayWarning();
 
         // 预警动画：脉冲闪烁
         float preTime = telegraphDuration - 0.3f;
@@ -763,12 +939,19 @@ public class EnemyOrderSystem : MonoBehaviour
 
         GameLogger.Log("[Boss] 招式0：直线冲锋");
 
-        Vector3 dashStart = activeAttacker.position;
+        // 严格水平化：dashDir 强制 .y = 0 并归一化，确保冲锋全程在 XZ 平面运行
+        // 起点 Y 锁定到 orbitBaseY（drone 贴地高度），消除任何随机浮空残留
+        Vector3 dashStart = new Vector3(activeAttacker.position.x, orbitBaseY, activeAttacker.position.z);
         Vector3 dashDir   = activeAttacker.forward;
+        dashDir.y = 0f;
+        dashDir.Normalize();
         Vector3 dashEnd   = dashStart + dashDir * chargeLength;
-        Vector3 dashDirH  = new Vector3(dashDir.x, 0f, dashDir.z).normalized;
+        Vector3 dashDirH  = dashDir;
         elapsed = 0f;
         bool hit = false;
+
+        // 同时把当前 drone 的 Y 也锁回 orbitBaseY，防止前一帧的浮空污染起跳点
+        activeAttacker.position = dashStart;
 
         while (elapsed < chargeDuration)
         {
@@ -826,6 +1009,8 @@ public class EnemyOrderSystem : MonoBehaviour
         sweepFanMat.color = new Color(1f, 0.9f, 0f, 0.25f);
         sweepFanMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 2.5f);
         sweepFanObj.SetActive(isOrderVision);
+        // 破核权限隔离：CanPierceCore（Shift 或子弹时间）才允许听到预警
+        if (playerRef != null && playerRef.CanPierceCore) AudioManager.PlayWarning();
 
         float preTime = telegraphDuration - 0.3f;
         float elapsed = 0f;
@@ -930,6 +1115,8 @@ public class EnemyOrderSystem : MonoBehaviour
         UpdateRingMesh(ringMesh, 0f, 0.5f);
         shockwaveMat.color = new Color(1f, 0.9f, 0f, 0.55f);
         shockwaveRingObj.SetActive(true);
+        // 破核权限隔离：CanPierceCore（Shift 或子弹时间）才允许听到预警
+        if (playerRef != null && playerRef.CanPierceCore) AudioManager.PlayWarning();
 
         float chargeT = telegraphDuration - 0.3f;
         float elapsed = 0f;
@@ -938,7 +1125,7 @@ public class EnemyOrderSystem : MonoBehaviour
             elapsed += Time.deltaTime;
             float p     = Mathf.Clamp01(elapsed / chargeT);
             float pulse = 0.5f + 0.5f * Mathf.Sin(elapsed * Mathf.PI * 5f);
-            UpdateRingMesh(ringMesh, 0f, Mathf.Lerp(0.3f, 2.2f, p));
+            UpdateRingMesh(ringMesh, 0f, Mathf.Lerp(0.3f * attackScale, 2.2f * attackScale, p));
             Color c = shockwaveMat.color;
             c.a = Mathf.Lerp(0.3f, 0.9f, pulse);
             shockwaveMat.color = c;
@@ -1025,11 +1212,13 @@ public class EnemyOrderSystem : MonoBehaviour
         missileWarningActive = true;
 
         warningArea.transform.position = attackerPos + activeAttacker.forward * 3f + Vector3.up * 0.05f;
-        warningArea.transform.localScale    = new Vector3(0.15f, 1f, 0.15f);
+        warningArea.transform.localScale    = new Vector3(0.15f * attackScale, 1f, 0.15f * attackScale);
         warningArea.transform.rotation = Quaternion.identity;
         warningMat.color = new Color(1f, 0.9f, 0f, 0.5f);
         warningMat.SetColor("_EmissionColor", new Color(1f, 0.9f, 0f) * 3f);
         ApplyVisibility();
+        // 破核权限隔离：CanPierceCore（Shift 或子弹时间）才允许听到预警
+        if (playerRef != null && playerRef.CanPierceCore) AudioManager.PlayWarning();
 
         float   elapsed   = 0f;
         float   lockTime  = telegraphDuration - 0.3f;
@@ -1128,7 +1317,7 @@ public class EnemyOrderSystem : MonoBehaviour
             // ReceiveAttack 会被无敌帧拦截并触发"完美闪避"子弹时间
             if (playerRef != null)
             {
-                var cols = Physics.OverlapSphere(cur, 1.5f);
+                var cols = Physics.OverlapSphere(cur, 1.5f * attackScale);
                 foreach (var col in cols)
                 {
                     int dIdx = GetDroneIndex(col);
@@ -1203,17 +1392,15 @@ public class EnemyOrderSystem : MonoBehaviour
     public void TakeDamage(float damage, bool isPerfectCounter, int droneIndex)
     {
         if (currentHealth <= 0) return;
+        if (hitCooldown > 0f) return;
 
         if (droneIndex >= 0 && droneIndex != currentCoreIndex)
         {
             GameLogger.Log("幻影免疫！这不是真身！");
             return;
         }
-        if (droneIndex >= 0 && !isOrderVision)
-        {
-            GameLogger.Log("攻击无效！需要按住 Shift 看破真身！");
-            return;
-        }
+
+        hitCooldown = 0.1f;
 
         switch (currentState)
         {
@@ -1222,7 +1409,6 @@ public class EnemyOrderSystem : MonoBehaviour
                 float reducedDamage = damage * damageReduction;
                 currentHealth -= reducedDamage;
                 GameLogger.Log($"外壳防护！仅受 {reducedDamage:F1} 点刮痧伤害");
-                AudioManager.PlayHitCore();
                 break;
 
             case EnemyState.Recovery:
@@ -1231,22 +1417,22 @@ public class EnemyOrderSystem : MonoBehaviour
                     GameLogger.Log("防反破核！怪物进入瘫痪！");
                     AudioManager.PlayHitCore();
                     TriggerStun();
+                    CheckPhaseSplit();
                     return;
                 }
                 currentHealth -= damage;
                 GameLogger.Log($"抓后摇！受到 {damage:F1} 点伤害");
-                AudioManager.PlayHitCore();
                 break;
 
             case EnemyState.Stunned:
                 float critDamage = damage * critMultiplier;
                 currentHealth -= critDamage;
                 GameLogger.Log($"核心暴击！受到 {critDamage:F1} 点伤害");
-                AudioManager.PlayHitCore();
                 break;
         }
 
-        if (currentHealth <= 0) { currentHealth = 0; Die(); }
+        if (currentHealth <= 0) { currentHealth = 0; Die(); return; }
+        CheckPhaseSplit();
     }
 
     void TriggerStun()
@@ -1313,6 +1499,7 @@ public class EnemyOrderSystem : MonoBehaviour
     {
         if (attackCycleCoroutine != null) StopCoroutine(attackCycleCoroutine);
         if (stunTimerCoroutine   != null) StopCoroutine(stunTimerCoroutine);
+        if (phaseSplitCoroutine  != null) StopCoroutine(phaseSplitCoroutine);
 
         for (int i = activeMissileObjs.Count - 1; i >= 0; i--)
             if (activeMissileObjs[i] != null) Destroy(activeMissileObjs[i]);
@@ -1322,6 +1509,7 @@ public class EnemyOrderSystem : MonoBehaviour
             for (int i = 0; i < drones.Length; i++)
                 if (drones[i] != null) SpawnDeathEffect(drones[i].transform.position);
 
+        VictoryManager.Trigger();
         Destroy(gameObject);
     }
 

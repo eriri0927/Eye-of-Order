@@ -183,7 +183,7 @@ MeshRenderer:
   m_RenderingLayerMask: 1
   m_RendererPriority: 0
   m_Materials:
-  - {fileID: 10303, guid: 0000000000000000f000000000000000, type: 0}
+  - {fileID: 2100000, guid: 025695aa529f39b41af446c6ffc94cd2, type: 2}
   m_StaticBatchInfo:
     firstSubMesh: 0
     subMeshCount: 0
@@ -460,6 +460,7 @@ MonoBehaviour:
   jumpCost: 15
   fireRate: 0.2
   playerMaxHealth: 100
+  isTransitionFrozen: 0
 --- !u!143 &1039393562
 CharacterController:
   m_ObjectHideFlags: 0
@@ -559,6 +560,55 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 42c7ab26a66333e4caaec7fb99bae194, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+--- !u!1 &1401685322
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 1401685324}
+  - component: {fileID: 1401685323}
+  m_Layer: 0
+  m_Name: AudioManager
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!114 &1401685323
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1401685322}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a07c735b3d56eb14ebe6c39803f5e689, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  dodgeClip: {fileID: 8300000, guid: 7e36bac74b1e1b247ac2fbc54f96804f, type: 3}
+  perfectDodgeClip: {fileID: 8300000, guid: 5e10278eda2a3ef4bbe6f86b959444c8, type: 3}
+  fireClip: {fileID: 8300000, guid: b5827046e95c35948942f87ddca520f5, type: 3}
+  hitCoreClip: {fileID: 8300000, guid: 48a3f73aafaaa7b4b838d413fccd4e75, type: 3}
+  warningClip: {fileID: 8300000, guid: 8414e0317dfe41f4cae47cca027f3dcb, type: 3}
+--- !u!4 &1401685324
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1401685322}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &2131652688
 GameObject:
   m_ObjectHideFlags: 0
@@ -614,6 +664,7 @@ MonoBehaviour:
   healthBarWidth: 200
   healthBarHeight: 20
   healthBarOffsetY: 50
+  currentPhase: 0
 --- !u!4 &2131652690
 Transform:
   m_ObjectHideFlags: 0
@@ -638,3 +689,4 @@ SceneRoots:
   - {fileID: 1039393563}
   - {fileID: 2131652690}
   - {fileID: 1223916096}
+  - {fileID: 1401685324}

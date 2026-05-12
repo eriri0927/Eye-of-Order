@@ -18,7 +18,7 @@ public class PlayerController : MonoBehaviour
 
     public float maxStamina = 100f;
     public float staminaRegenRate = 10f;
-    public float dodgeCost = 20f;
+    public float dodgeCost = 25f;
     public float jumpCost = 15f;
 
     public float fireRate = 0.2f;
@@ -42,12 +42,21 @@ public class PlayerController : MonoBehaviour
     private float dodgeFlashTimer;
     private const float dodgeFlashDuration = 0.2f;
     private float dodgeBufferTimer;
+    private Vector3 dodgeDirection;
+    private Vector3 cameraVelocity;
+    private float dodgeCooldownTimer;
+    private const float dodgeCooldown = 0.35f;
+
+    [HideInInspector] public bool isTransitionFrozen = false;
 
     void Awake()
     {
         dodgeSpeed = 6f;
         dodgeDuration = 0.15f;
         invincibleDuration = 0.5f;
+        dodgeCost = 25f;
+        dodgeCooldownTimer = 0f;
+        isTransitionFrozen = false;
     }
 
     void Start()
@@ -67,11 +76,10 @@ public class PlayerController : MonoBehaviour
         {
             GameObject camObj = new GameObject("Main Camera");
             camObj.tag = "MainCamera";
-            camObj.transform.SetParent(transform);
-            camObj.transform.localPosition = new Vector3(0f, 1.2f, -2f);
-            camObj.transform.localRotation = Quaternion.identity;
             mainCamera = camObj.AddComponent<Camera>();
         }
+        mainCamera.transform.SetParent(null);
+        mainCamera.transform.position = transform.position - transform.forward * 4.5f + transform.right * 1.2f + Vector3.up * 2f;
 
         enemyOrderSystem = FindObjectOfType<EnemyOrderSystem>();
 
@@ -133,6 +141,16 @@ public class PlayerController : MonoBehaviour
         if (dodgeBufferTimer > 0f)
             dodgeBufferTimer -= Time.deltaTime;
 
+        if (dodgeCooldownTimer > 0f)
+            dodgeCooldownTimer -= Time.deltaTime;
+
+        if (isTransitionFrozen)
+        {
+            velocity = Vector3.zero;
+            controller.Move(Vector3.zero);
+            return;
+        }
+
         if (Input.GetMouseButtonDown(1) && !Input.GetKey(KeyCode.LeftShift))
             dodgeBufferTimer = 0.15f;
 
@@ -152,8 +170,10 @@ public class PlayerController : MonoBehaviour
         bool canAct = !Input.GetKey(KeyCode.LeftShift);
 
         Vector3 move = Vector3.zero;
-        if (canAct && !isDodging)
-            move = GetMovementInput();
+        if (isDodging)
+            move = dodgeDirection * dodgeSpeed;
+        else if (canAct)
+            move = GetMovementInput() * moveSpeed;
 
         if (canAct)
         {
@@ -162,22 +182,30 @@ public class PlayerController : MonoBehaviour
             HandleShoot();
         }
 
+        if (!isDodging && move.sqrMagnitude < 0.001f)
+        {
+            velocity.x = 0f;
+            velocity.z = 0f;
+        }
+
         if (velocity.y < 0f)
             velocity.y += gravity * fallGravityMultiplier * Time.deltaTime;
         else
             velocity.y += gravity * Time.deltaTime;
 
-        controller.Move((move * moveSpeed + velocity) * Time.deltaTime);
+        controller.Move((move + velocity) * Time.deltaTime);
+    }
+
+    void LateUpdate()
+    {
+        if (mainCamera != null && !isDead)
+            CameraFollow();
     }
 
     void HandleEnemyOrder()
     {
         if (enemyOrderSystem == null) return;
-
-        if (Input.GetKey(KeyCode.LeftShift))
-            enemyOrderSystem.SwitchToOrder(true);
-        else
-            enemyOrderSystem.SwitchToOrder(false);
+        enemyOrderSystem.SwitchToOrder(CanPierceCore);
     }
 
     void HandleMouseLook()
@@ -189,14 +217,46 @@ public class PlayerController : MonoBehaviour
 
         cameraPitch -= mouseY;
         cameraPitch = Mathf.Clamp(cameraPitch, -60f, 60f);
-        mainCamera.transform.localRotation = Quaternion.Euler(cameraPitch, 0f, 0f);
     }
 
+    void CameraFollow()
+    {
+        Vector3 desiredPos = transform.position
+            - transform.forward * 4.5f
+            + transform.right * 1.2f
+            + Vector3.up * 2f;
+
+        mainCamera.transform.position = Vector3.SmoothDamp(
+            mainCamera.transform.position, desiredPos, ref cameraVelocity, 0.05f);
+
+        Vector3 lookTarget = transform.position + transform.forward * 10f + Vector3.up * 1.5f;
+        mainCamera.transform.LookAt(lookTarget);
+        mainCamera.transform.Rotate(cameraPitch, 0f, 0f);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 严格死区 + 摄像机向量包裹：
+    //   1. magnitude <= 0.1f 时一刀切回 Vector3.zero，绝不让亚阈值噪声进入向量管线
+    //   2. 仅在通过死区检查后，才读取 camera.right / camera.forward
+    //      并强制抹平 Y 轴（消除摄像机俯仰角对水平移动的污染）
+    //   3. 这样无输入时 camera 向量根本不会被取值 → 不可能"悄悄累加"
+    // ─────────────────────────────────────────────────────────────────────────
     Vector3 GetMovementInput()
     {
         float horizontal = Input.GetAxisRaw("Horizontal");
-        float vertical = Input.GetAxisRaw("Vertical");
-        return (transform.right * horizontal + transform.forward * vertical).normalized;
+        float vertical   = Input.GetAxisRaw("Vertical");
+        Vector2 moveInput = new Vector2(horizontal, vertical);
+
+        if (moveInput.magnitude <= 0.1f) return Vector3.zero;
+
+        Vector3 camRight   = mainCamera.transform.right;
+        Vector3 camForward = mainCamera.transform.forward;
+        camRight.y   = 0f;
+        camForward.y = 0f;
+        camRight.Normalize();
+        camForward.Normalize();
+
+        return (camRight * moveInput.x + camForward * moveInput.y).normalized;
     }
 
     void HandleJump()
@@ -212,10 +272,12 @@ public class PlayerController : MonoBehaviour
 
     void HandleDodge()
     {
-        if (dodgeBufferTimer > 0f && !Input.GetKey(KeyCode.LeftShift) && controller.isGrounded && !isDodging && currentStamina >= dodgeCost)
+        if (dodgeBufferTimer > 0f && dodgeCooldownTimer <= 0f && !Input.GetKey(KeyCode.LeftShift) && controller.isGrounded && !isDodging && currentStamina >= dodgeCost)
         {
             dodgeBufferTimer = 0f;
+            dodgeCooldownTimer = dodgeCooldown;
             currentStamina -= dodgeCost;
+            AudioManager.PlayDodge();
             StartCoroutine(DodgeBackward());
         }
     }
@@ -224,16 +286,24 @@ public class PlayerController : MonoBehaviour
     {
         isDodging = true;
         isInvincible = true;
-        float elapsed = 0f;
 
+        // 严格抹平 Y 轴：冲刺方向必须纯水平，不允许任何垂直分量混入
+        Vector3 fwd = transform.forward;
+        fwd.y = 0f;
+        dodgeDirection = -fwd.normalized;
+
+        float elapsed = 0f;
         while (elapsed < dodgeDuration)
         {
-            controller.Move(-transform.forward * dodgeSpeed * Time.deltaTime);
             elapsed += Time.deltaTime;
             yield return null;
         }
 
+        // 退出冲刺：彻底清空残余冲力变量，防止"幽灵冲刺方向"持续作用
+        dodgeDirection = Vector3.zero;
         isDodging = false;
+        velocity.x = 0f;
+        velocity.z = 0f;
 
         float remainTime = invincibleDuration - dodgeDuration;
         if (remainTime > 0f)
@@ -268,6 +338,7 @@ public class PlayerController : MonoBehaviour
     void Die()
     {
         isDead = true;
+        isWitchTime = false;
         Time.timeScale = 0f;
         Cursor.lockState = CursorLockMode.None;
         Cursor.visible = true;
@@ -278,6 +349,19 @@ public class PlayerController : MonoBehaviour
     {
         return isDead;
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 秩序态对外暴露：按住 Shift = isOrder == true
+    // CanPierceCore：统一的"破核权限"
+    //   满足以下任一条件即可破核：
+    //     1. isOrder（按住 Shift 进入秩序态）
+    //     2. isWitchTime（完美闪避后的 0.5s 慢动作窗口）
+    //     3. hasPerfectDodgeBuff（完美闪避后的完整 Buff 窗口，含慢动作 + 2s 余韵）
+    // EnemyOrderSystem 用 CanPierceCore 判断视觉显隐、攻击预警、伤害结算
+    // ─────────────────────────────────────────────────────────────────────────
+    public bool isOrder => !isDead && Input.GetKey(KeyCode.LeftShift);
+    public bool IsWitchTime => isWitchTime;
+    public bool CanPierceCore => isOrder || isWitchTime || hasPerfectDodgeBuff;
 
     IEnumerator PerfectDodgeFeedback()
     {
@@ -294,9 +378,11 @@ public class PlayerController : MonoBehaviour
 
     void HandleShoot()
     {
-        if (Input.GetMouseButton(0) && Time.time >= nextFireTime)
+        // GetMouseButtonDown 确保每次点击只判定一次，杜绝音效被 GetMouseButton 长按触发每帧重复
+        if (Input.GetMouseButtonDown(0) && Time.time >= nextFireTime)
         {
             nextFireTime = Time.time + fireRate;
+            AudioManager.PlayFire();
             FireBullet();
         }
     }
@@ -427,6 +513,9 @@ public class PlayerController : MonoBehaviour
         titleStyle.fontStyle = FontStyle.Bold;
         titleStyle.alignment = TextAnchor.MiddleCenter;
         titleStyle.normal.textColor = Color.red;
+        titleStyle.hover.textColor = Color.red;
+        titleStyle.active.textColor = Color.red;
+        titleStyle.focused.textColor = Color.red;
 
         float titleY = Screen.height * 0.25f;
         GUI.Label(new Rect(0, titleY, Screen.width, 150f), "卡 了", titleStyle);

@@ -4,31 +4,57 @@ using UnityEngine.SceneManagement;
 public class StoryManager : MonoBehaviour
 {
     private string storyText =
-        "2077年，世界陷入了'无序态'。\n" +
-        "所有的物质都在疯狂坍缩，\n" +
-        "肉眼所见皆是致命的混沌。\n\n" +
-        "唯有植入'秩序之眼'的躯壳，\n" +
-        "才能在毁灭的洪流中，\n" +
-        "捕捉到那一丝名为'真相'的蓝光。\n\n" +
-        "欢迎来到，秩序领域。\n\n\n\n" +
-        "——— 操 作 指 引 ———\n\n" +
-        "[WASD]        在混沌中穿梭\n" +
-        "[空格]          跃过震地冲击波\n" +
-        "[鼠标右键]    利用闪避踏入虚空\n" +
-        "[左键射击]    给予敌人最后的怜悯\n\n" +
-        "[按住 Shift]  开启秩序之眼\n" +
-        "警告：开启期间，你将失去一切机动。\n" +
-        "博弈：观察怪物的攻击后摇，\n" +
-        "那是核心暴露的唯一时刻。";
+@"2077 年，物理学崩坏。
+世界陷入了「无序态」。
 
-    private float scrollSpeed = 50f;
+所有物质都在疯狂坍缩，
+肉眼所见，皆是致命的混沌。
+
+唯有植入「秩序之眼」的躯壳，
+才能在毁灭的洪流中，
+捕捉到那一丝名为「真相」的蓝光。
+
+在秩序崩坏的废墟上，
+你的眼，即是最后的准星。
+
+
+——— 操作指引 ———
+
+[ WASD ]         移动
+   [ 鼠标 ]          视角旋转
+[ 空格 ]          跳跃
+[ 左键 ]          射击
+[ 右键 ]          闪避 
+
+[ 按住 Shift ]    开启秩序之眼
+
+警告：秩序视野下你将完全定身，失去一切机动。
+你将看见敌人的攻击预警、听见秩序的韵律，
+但代价是——你无法移动分毫。
+
+博弈：在观察与行动之间快速切换，
+观察前摇 · 记忆轨迹 · 精确闪避 · 抓取后摇。
+
+当怪物在技能收束中短暂停顿时，
+那便是核心暴露的唯一瞬间——
+你的子弹，就是秩序的终章。";
+
+    private float scrollSpeed = 56f;
     private float posY;
 
-    private GUIStyle textStyle;
-    private GUIStyle hintStyle;
-    private bool stylesInitialized = false;
-    private bool heightCalculated = false;
+    private GUIStyle  textStyle;
+    private GUIStyle  hintStyle;
+    private GUIStyle  titleStyle;
+    private bool      stylesReady;
+
     private float textTotalHeight;
+    private float textAreaWidth;
+
+    private Color accentCyan  = new Color(0f, 0.9f, 1f, 1f);
+    private Color accentGold  = new Color(1f, 0.85f, 0.3f, 1f);
+    private Color subtleWhite = new Color(0.85f, 0.85f, 0.9f, 1f);
+
+    private float hintPulse;
 
     void Start()
     {
@@ -37,62 +63,78 @@ public class StoryManager : MonoBehaviour
 
     void InitStyles()
     {
-        if (stylesInitialized) return;
+        if (stylesReady) return;
 
         textStyle = new GUIStyle();
-        textStyle.fontSize = 24;
-        textStyle.normal.textColor = Color.white;
+        textStyle.fontSize  = 24;
+        textStyle.normal.textColor = subtleWhite;
         textStyle.alignment = TextAnchor.UpperCenter;
-        textStyle.wordWrap = true;
+        textStyle.wordWrap  = true;
+        textStyle.richText  = true;
+
+        titleStyle = new GUIStyle();
+        titleStyle.fontSize  = 20;
+        titleStyle.normal.textColor = accentCyan;
+        titleStyle.alignment = TextAnchor.UpperCenter;
 
         hintStyle = new GUIStyle();
-        hintStyle.fontSize = 18;
-        hintStyle.normal.textColor = new Color(0.4f, 0.8f, 1f, 1f);
+        hintStyle.fontSize  = 17;
+        hintStyle.normal.textColor = accentCyan;
         hintStyle.alignment = TextAnchor.LowerRight;
 
-        stylesInitialized = true;
+        stylesReady = true;
     }
 
     void Update()
     {
         posY -= scrollSpeed * Time.deltaTime;
+        hintPulse = (Mathf.Sin(Time.time * 2.3f) + 1f) * 0.5f;
 
-        // 按回车跳转战斗场景
-        if (Input.GetKeyDown(KeyCode.Return))
-        {
+        if (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.Space))
             SceneManager.LoadScene(2);
-        }
 
-        // 文字完全滚出屏幕顶部后自动跳转
-        if (heightCalculated && posY + textTotalHeight < 0)
-        {
+        if (heightCalculated() && posY + textTotalHeight < 0)
             SceneManager.LoadScene(2);
-        }
+    }
+
+    bool heightCalculated()
+    {
+        if (textAreaWidth <= 0f) return false;
+        return textTotalHeight > 0f;
     }
 
     void OnGUI()
     {
         InitStyles();
 
-        // 首次渲染时利用 CalcHeight 精确计算文本总高度
-        if (!heightCalculated)
-        {
-            float textAreaWidth = Screen.width * 0.8f;
-            textTotalHeight = textStyle.CalcHeight(new GUIContent(storyText), textAreaWidth);
-            heightCalculated = true;
-        }
+        if (textAreaWidth <= 0f)
+            textAreaWidth = Screen.width * 0.72f;
 
-        // 全屏黑幕
+        if (textTotalHeight <= 0f)
+            textTotalHeight = textStyle.CalcHeight(new GUIContent(storyText), textAreaWidth);
+
         GUI.color = Color.black;
         GUI.DrawTexture(new Rect(0, 0, Screen.width, Screen.height), Texture2D.whiteTexture);
         GUI.color = Color.white;
 
-        // 滚动文本区域
-        float areaWidth = Screen.width * 0.8f;
-        float areaX = Screen.width * 0.1f;
-        GUI.Label(new Rect(areaX, posY, areaWidth, 2000), storyText, textStyle);
+        float areaX = (Screen.width - textAreaWidth) * 0.5f;
+        GUI.Label(new Rect(areaX, posY, textAreaWidth, Mathf.Max(textTotalHeight, Screen.height * 2f)),
+                  storyText, textStyle);
 
-        // 底部右下角固定提示
-        GUI.Label(new Rect(Screen.width * 0.5f, Screen.height - 50, Screen.width * 0.48f, 40), "按 [回车键] 踏入秩序", hintStyle);
+        float lineY = Screen.height - 76f;
+        float dividerWidth = Mathf.Lerp(120f, 260f, hintPulse);
+        float dividerX = Screen.width * 0.88f - dividerWidth;
+
+        GUI.color = new Color(accentCyan.r, accentCyan.g, accentCyan.b, 0.35f + hintPulse * 0.35f);
+        GUI.DrawTexture(new Rect(dividerX, lineY + 28f, dividerWidth, 1f), Texture2D.whiteTexture);
+
+        GUI.color = Color.Lerp(accentCyan, accentGold, hintPulse);
+        hintStyle.normal.textColor = GUI.color;
+
+        GUI.Label(new Rect(Screen.width * 0.48f, Screen.height - 54f,
+                           Screen.width * 0.48f, 38f),
+                  "按 [ 回车 ] 踏入秩序", hintStyle);
+
+        GUI.color = Color.white;
     }
 }
