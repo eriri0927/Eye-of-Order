@@ -169,145 +169,52 @@ Re:从零开始的异世界生活（白鲸讨伐战）：
    数据结构已分离为 Inspector 可调参数，支持快速迭代。
 
 ═══════════════════════════════════════════════════════
-四、 BOSS AI 系统：Eye of Order（三体幻影）
+四、 BOSS AI：三体幻影（Eye of Order）
 ═══════════════════════════════════════════════════════
 
-Boss 由 3 个红色立方体 Drone 组成，共享同一血条（1000 HP）。
-战斗分为两个阶段，以血量 50% 为分界：
+3 个红色立方体 Drone 共享 1000 HP，招式数值基础值 × attackScale(1.8)。
 
-注：下文招式数值为基础设计值，实际游戏内统一乘以 attackScale（1.8）进行视觉与判定等比放大。
+【双阶段结构】
+P1 巨物压迫：仅激活 Drone_0（3 倍体型），独占全部攻击，玩家专注学习招式。
+P2 三体幻影：50% HP 触发分裂演出（冻结 1s → 缩放 → 激活双体 → 解冻），
+  3 体独立巡逻（走 2~3s / 停 1~2s），超出 12m 或贴近 3m 时 120° 折返，
+  间距 < 3m 同伴避让，Y 轴锁定 0.5f，始终 LookAt 玩家。
 
-── Phase 1（P1：巨物压迫）──
-开场仅激活 Drone_0（3 倍体型），以巨型单体的姿态压迫玩家。
-所有攻击由 Drone_0 独占，玩家专注于学习四种招式的前摇与闪避窗口。
+【核心轮转与攻击权分离】
+P1 恒定 Drone_0 为真身；P2 每次前摇随机更换真身（currentCoreIndex）。
+真身与攻击者分离——攻击你的 Drone 未必是真身。
+- 无序态：3 体外观完全相同（纯红实体）
+- 秩序态（Shift/子弹时间/防反Buff）：仅真身变为半透明，暴露黄色核心
+- Stunned（瘫痪 5s）：全部灰色半透明，核心外露
 
-── Phase 2（P2：三体幻影）──
-Boss 血量降至 50% 时触发阶段转换演出：Drone_0 缩小至 1.5 倍，
-Drone_1、Drone_2 从虚空中被激活，三体阵型完全展开。
-玩家在转换期间被冻结（1 秒定身），保证镜头聚焦于分裂过程。
-进入 P2 后，3 个 Drone 以独立巡逻方式游走于战场，
-各自拥有随机的走停计时器与避让逻辑。
+【伤害结算】
+命中需同时满足：(1) 打中真身 (2) CanPierceCore 生效，否则免疫。
+命中后 0.1s 受击冷却防抖，免疫不触发冷却。
+状态机：Normal → Telegraphing → Recovery → Normal；防反破核 → Stunned(5s)。
+出招间隔 3s / 蓄力 1.5s / 后摇 1.5s，前 0.3s 亮黄色预警球。
+预警音效仅 CanPierceCore 时可听（秩序隔离）。
 
-── 阵型与朝向 ──
-初始布阵：以玩家为中心、半径 8m，三体分别位于 0°/120°/240°。
-Y 轴锁定在 orbitBaseY = 0.5f（贴地悬浮）。
-每个 Drone 始终 LookAt 玩家中心，视觉上保持"面对主角"的压迫感。
-P2 阶段各 Drone 独立巡逻：沿随机方向行进 2~3 秒后停歇 1~2 秒，
-超出 12m 或贴近至 3m 时自动 120° 折返，相互间距不足 3m 时也会避让。
+【四招招式】
+招式 0 — 直线冲锋：2m×8m 贴地矩形预警，0.3s 瞬移，伤害 25
+招式 1 — 扇形横扫：程序化扇形 Mesh，EaseIn 砸落，伤害 20
+招式 2 — 震地冲击波：空心圆环扩散至 8m，环内安全，伤害 35
+招式 3 — 贝塞尔飞弹：3 枚追踪弧线弹，锁定后发射，伤害 15/枚
+  ※ 扇形横扫仅在距玩家较近时触发，远处替换为冲锋/冲击波。
 
-── 核心轮转（Core Roulette）──
-P1 阶段：Drone_0 恒为真身，无需轮转。
-P2 阶段：每次攻击前摇阶段，系统随机更换当前真身（currentCoreIndex），
-真身可能与攻击者分离——即攻击你的 Drone 未必是真身。
-- 无序态（未获得破核权限）：3 个 Drone 外表完全相同（纯红色实体）。
-- 秩序态（Shift / 子弹时间 / 防反Buff）：只有真身 Drone 变为半透明，内部暴露黄色核心；
-  另外两个 Drone 依旧保持红色实体外观。
-- Stunned（瘫痪）：全部 3 个 Drone 变为灰色半透明，黄色核心全部暴露。
-
-── 伤害免疫系统 ──
-玩家射击命中某个 Drone 时，必须同时满足：
-  1. 命中目标的索引 == currentCoreIndex（打对真身）
-  2. CanPierceCore == true（破核权限生效：按住 Shift 进入秩序态，
-     或处于子弹时间 / 持有防反破核 Buff）
-否则伤害强制为 0，GameLogger 输出"幻影免疫！"或"攻击无效！"。
-受击冷却（hitCooldown）：成功扣血后启动 0.1s 无敌窗口，
-  Update() 每帧递减，冷却期间无视后续所有伤害请求。
-  冷却仅在免疫检查全部通过后才触发，免疫子弹不会误启动冷却。
-
-── 攻击权分离（Attack Separation）──
-真身 Drone 不一定是发动攻击的那个！
-每次攻击前，系统随机抽取一个 Drone 作为 currentAttacker。
-所有攻击预警（黄点、几何黄圈）和攻击动作（瞬移、发波）
-均由 currentAttacker 执行。
-
-状态机：Normal → Telegraphing → Recovery → Normal（循环）
-         ↓ (防反破核)
-       Stunned（5s）→ Normal
-
-出招间隔 3s（Normal），蓄力 1.5s（Telegraphing），后摇 1.5s（Recovery）。
-每次攻击前 0.3s 会亮起黄色球体渐隐动画作为统一预警信号。
-
-── 预警音效秩序隔离 ──
-预警音效（AudioManager.PlayWarning()）与破核权限严格绑定：
-四招攻击协程（Attack0~Attack3）在前摇开始时调用 PlayWarning()，
-外层包裹 `if (playerRef != null && playerRef.CanPierceCore)` 条件判断。
-未获得破核权限（Shift / 子弹时间 / 防反Buff 均未激活）= 听不到任何预警音，
-听觉信息是破核状态的专属奖励。
-
-招式 0 —— 直线冲锋（Linear Dash）
-  预警：2m×8m 长条矩形（仅 Shift 可见），黄色半透明贴地 Plane。
-  表现：attacker Drone 沿 forward 方向瞬移 8m（0.3s 内 Lerp），
-        dashStart 的 Y 轴锁定在 orbitBaseY，消除浮空偏移。
-  伤害：25
-
-招式 1 —— 扇形横扫（Fan Sweep）
-  预警：程序化扇形 Mesh 贴地（仅 Shift 可见），黄色脉冲。
-  表现：红色扇形体从 attacker 上方 5m 高空以 EaseIn 加速砸落（0.1s），
-        停留 0.3s 后 0.18s 渐隐消散。
-  伤害：20
-
-招式 2 —— 震地冲击波（Ground Shockwave）
-  预警：从 attacker 中心向外脉冲扩张的黄色圆环（Shift 可见）。
-  表现：程序化 Mesh 圆环从 attacker 中心扩散至 8m，透明度渐弱。
-  伤害：35
-
-  安全区：attacker 中心（环未到达）或 8m 外（环已扫过）。
-招式 3 —— 贝塞尔弧线飞弹（Bézier Projectiles）
-  蓄力阶段：追踪预警圈（小黄色圆）实时跟随玩家脚下。
-  锁定时刻（-0.3s）：玩家当前位置被冻结为锁定目标。
-  发射：3 枚红色立方体飞弹（0.2×0.2×0.5），走不同二次贝塞尔弧线。
-  伤害：15/枚
-
+═══════════════════════════════════════════════════════
 五、 开发文件清单
 ═══════════════════════════════════════════════════════
 
-PlayerController.cs     玩家移动（摄像机相对+死区过滤+单 Move 通道）、
-                        闪避（dodgeDirection 向量驱动，纯水平化，输入缓冲）、
-                        射击（GetMouseButtonDown 单击单发）、
-                        完美闪避/子弹时间、体力条 UI、血条 UI、
-                        死亡 UI、准星 UI、生命管理、
-                        isOrder / CanPierceCore 公开属性。
-
-EnemyOrderSystem.cs     Boss 管理器模式（三体幻影）：3 Drone 生成、
-                        双阶段设计（P1 巨物压迫 / P2 三体幻影）、
-                        独立巡逻系统（走停计时器+同伴避让+距离折返）、
-                        阵型与朝向（LookAt + 贴地锁定）、
-                        核心轮转（每次攻击前随机更换真身）、
-                        攻击权分离、
-                        状态机（Normal/Telegraphing/Recovery/Stunned）、
-                        四招攻击协程、OBB/扇形/空心环/贝塞尔判定、
-                        程序化 Mesh 构建（圆环/扇形）、
-                        材质系统（URP/Standard/Unlit 三级降级）、
-                        Drone 视觉状态管理、Boss 血条 UI、
-                        伤害结算（免疫/刮痧/全额/暴击）、
-                        受击冷却（0.1s I-Frame 防抖）、防反破核、
-                        预警音效秩序隔离（CanPierceCore 绑定）、
-                        阶段转换演出（冻结+分裂动画）、
-                        Boss 死亡碎裂特效。
-
-BulletBehaviour.cs      子弹飞行（150m/s）、RaycastAll 碰撞检测、
-                        命中特效（黄色发光小球 0.5s 消散）。
-
-HomingProjectile.cs     双模式飞弹（追踪/直线），SphereCastAll 碰撞，
-                        可见性开关（跟随 Shift 视野）。
-
-GameLogger.cs           全局静态日志系统，OnGUI 右上角渲染。
-
-GameManager.cs          暂停菜单（Esc）、死亡状态锁定暂停、
-                        继续/重新开始/退出按钮。
-
-VictoryManager.cs       胜利界面（Canvas UI）、
-                        全屏半透明遮罩 + 居中"胜利"标题、
-                        重新开始/返回菜单按钮。
-
-StoryManager.cs         滚动文本逻辑、回车跳过、自动跳转。
-
-MainMenuManager.cs      主菜单 UI、背景加载、开始/退出按钮。
-
-AudioManager.cs         单例音效管理器（DontDestroyOnLoad），
-                        5 个 AudioClip 槽位 + PlayOneShot 播放。
-                        音效素材来源：freesound.org（经个人剪辑与调速修改），
-                        射击音效参考 CS 系列爆头音效与枪声设计。
+PlayerController.cs   移动+闪避+射击+完美闪避/子弹时间+体力/血条/死亡UI+CanPierceCore
+EnemyOrderSystem.cs   Boss 双阶段+独立巡逻+核心轮转+攻击权分离+四招协程+程序化Mesh+阶段转换演出
+BulletBehaviour.cs    子弹飞行(150m/s)+RaycastAll+命中特效
+HomingProjectile.cs   双模式飞弹(追踪/直线)+Shift可见性
+GameLogger.cs         全局日志(OnGUI 右上角)
+GameManager.cs        暂停菜单(Esc)
+VictoryManager.cs     胜利界面(OnGUI)+全屏遮罩+按钮
+StoryManager.cs       开场滚动字幕+跳过
+MainMenuManager.cs    主菜单UI
+AudioManager.cs       单例音效(DontDestroyOnLoad, 5 Clip槽位)
 
 
 ═══════════════════════════════════════════════════════
